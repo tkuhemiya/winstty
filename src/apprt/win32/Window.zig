@@ -13,16 +13,25 @@ const Config = @import("../../config.zig").Config;
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const App = @import("App.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const Outline = @import("Outline.zig");
 const Surface = @import("Surface.zig");
+const Ticker = @import("Ticker.zig");
 const c = @import("c.zig");
+const glass = @import("glass.zig");
+const layoutpkg = @import("layout.zig");
+const motion = @import("motion.zig");
 const paint = @import("paint.zig");
 
 const log = std.log.scoped(.win32);
 
 pub const Tree = SplitTree(Surface);
+const Layout = layoutpkg.Layout(Surface);
 
 /// Posted by `requestCloseTab`. wParam is the tab ID, lParam the mode.
 const WM_CLOSE_TAB = c.WM_APP + 1;
+
+/// Posted to destroy the surfaces that the layout is done with.
+const WM_BURY = c.WM_APP + 2;
 
 // 96 DPI lengths.
 const title_height = 40;
@@ -44,8 +53,36 @@ const outline_focused = 2;
 const card_inset = 5;
 const resize_band = 5;
 
-const animation_timer = 1;
-const animation_ms = 15;
+// Of the side panel.
+const panel_width = 200;
+const panel_min_width = 64;
+const panel_pad = 6;
+const row_height = 34;
+const row_gap = 2;
+const row_radius = 9;
+const row_pad = 10;
+const thumb_width = 3;
+
+/// The panel gives way to the terminal.
+const terminal_min_width = 280;
+
+/// The size of a terminal doesn't follow its area below this while it moves.
+const moving_min_width = 160;
+const moving_min_height = 80;
+
+/// At most this long before anything moves, for the first frames to be drawn.
+const prepare_ms = 120;
+
+/// At most this long in each frame, for the frames of panes.
+const await_ms = 10;
+
+/// Retries destroying surfaces while a message box is open.
+const bury_timer = 1;
+const bury_ms = 100;
+
+/// Glass is taken away after everything on it is opaque.
+const backing_timer = 2;
+const backing_ms = 120;
 
 pub const Tab = struct {
     /// Unique for the life of the app, so it can be posted in messages.
@@ -55,6 +92,9 @@ pub const Tab = struct {
     /// The surface with focus when the tab is selected. Always in the tree.
     focused: *Surface,
     title_override: ?[:0]const u8 = null,
+
+    /// Where it is in the side panel, in rows.
+    row: motion.Spring = .at(0),
 
     fn deinit(self: *Tab, alloc: Allocator) void {
         if (self.title_override) |v| alloc.free(v);
@@ -71,6 +111,14 @@ pub const Tab = struct {
         return false;
     }
 };
+
+/// The title of a tab as it's shown. A blank one is a way of hiding the title
+/// of the window, but tabs need something to tell them apart.
+fn tabLabel(self: *const Window, index: usize, buf: *[8]u8) []const u8 {
+    const title = std.mem.trim(u8, self.tabs.items[index].title(), " ");
+    if (title.len > 0) return title;
+    return std.fmt.bufPrint(buf, "{}", .{index + 1}) catch "";
+}
 
 /// A draggable boundary of the current layout.
 const Divider = struct {
@@ -92,6 +140,8 @@ const Card = struct {
     card: c.RECT,
     /// The terminal inside of it.
     hole: c.RECT,
+    /// Whether there's room for more than the gap.
+    shown: bool,
 };
 
 const Hit = union(enum) {
@@ -103,6 +153,9 @@ const Hit = union(enum) {
 
     /// Anywhere else at the top, which moves the window.
     caption,
+
+    /// Anywhere else in the side panel.
+    panel,
     divider: usize,
 
     fn eql(a: Hit, b: Hit) bool {
@@ -115,7 +168,19 @@ const Button = enum { close, minimize, zoom };
 const Drag = union(enum) {
     none,
     tab: struct { start_x: c_int, start_y: c_int, moving: bool = false },
+    row: RowDrag,
     divider: usize,
+};
+
+/// A tab being moved in the side panel.
+const RowDrag = struct {
+    id: u32,
+    /// Where on the row it was taken hold of.
+    grab: c_int,
+    start_y: c_int,
+    moving: bool = false,
+    /// Where it would be dropped.
+    to: usize,
 };
 
 app: *App,
@@ -124,8 +189,33 @@ tabs: std.ArrayList(Tab) = .empty,
 active: usize = 0,
 title_override: ?[:0]const u8 = null,
 
+/// Where the panes of the active tab are.
+layout: Layout,
+/// The tab that the layout is of.
+layout_tab: u32 = 0,
+placements: std.ArrayList(Layout.Placement) = .empty,
+boundaries: std.ArrayList(Layout.Boundary) = .empty,
 dividers: std.ArrayList(Divider) = .empty,
 cards: std.ArrayList(Card) = .empty,
+
+/// How much of a card panes are, from filling the window to being one.
+card_amount: motion.Spring = .at(0),
+
+/// How much of the side panel is in view.
+panel: motion.Spring = .at(0),
+/// Pixels scrolled off the top of the list of tabs.
+panel_scroll: c_int = 0,
+tooltip: ?c.HWND = null,
+/// What the tooltip is of, as `setHover` last saw it.
+tooltip_tab: ?usize = null,
+
+/// The pane that has the outline. Only for comparing.
+outlined: ?*const Surface = null,
+/// The outline on its way from where it was.
+outline_from: paint.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+outline_amount: motion.Spring = .at(1),
+outline_window: ?Outline = null,
+
 hover: Hit = .none,
 drag: Drag = .none,
 tracking_leave: bool = false,
@@ -134,8 +224,12 @@ font_bold: ?c.HFONT = null,
 font_icon: ?c.HFONT = null,
 
 /// Where the selection is drawn, as a tab index. It moves towards `active`.
-selection: f32 = 0,
+selection: motion.Spring = .at(0),
+
+/// Frames of animation are wanted, the last of which was at this time.
 animating: bool = false,
+last_frame: ?i64 = null,
+started: i64 = 0,
 
 /// Whether we look active. That's also so while one of our popups is.
 is_active: bool = true,
@@ -150,6 +244,10 @@ minimized: bool = false,
 
 /// True if background-opacity is toggled off.
 force_opaque: bool = false,
+
+/// Whether we're glass as far as the compositor knows.
+frosted: bool = false,
+power_notification: ?c.HANDLE = null,
 
 /// Placement to restore when leaving fullscreen. Non-null in fullscreen.
 windowed: ?struct { placement: c.WINDOWPLACEMENT, style: isize } = null,
@@ -187,13 +285,14 @@ fn createEmpty(app: *App) !*Window {
 
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
-    self.* = .{ .app = app, .hwnd = hwnd };
+    self.* = .{ .app = app, .hwnd = hwnd, .layout = .init(alloc) };
     try app.windows.append(alloc, self);
 
     // From here, destroying the window deinitializes us.
     _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.updateFont();
     self.syncAppearance();
+    self.power_notification = c.RegisterPowerSettingNotification(hwnd, &c.GUID_POWER_SAVING_STATUS, 0);
     return self;
 }
 
@@ -210,6 +309,7 @@ fn show(self: *Window) void {
 pub fn destroy(self: *Window) void {
     const alloc = self.app.core_app.alloc;
     _ = c.ShowWindow(self.hwnd, c.SW_HIDE);
+    self.forgetLayout();
     while (self.tabs.pop()) |popped| {
         // Nothing may be found through a tab that's going away.
         var tab = popped;
@@ -229,8 +329,13 @@ fn deinit(self: *Window) void {
     };
 
     if (self.palette) |v| v.destroy();
+    if (self.power_notification) |v| _ = c.UnregisterPowerSettingNotification(v);
+    self.forgetLayout();
     for (self.tabs.items) |*tab| tab.deinit(alloc);
     self.tabs.deinit(alloc);
+    self.layout.deinit();
+    self.placements.deinit(alloc);
+    self.boundaries.deinit(alloc);
     self.dividers.deinit(alloc);
     self.cards.deinit(alloc);
     if (self.title_override) |v| alloc.free(v);
@@ -293,9 +398,11 @@ pub fn newTabWith(self: *Window, context: apprt.surface.NewSurfaceContext, comma
 fn insertTab(self: *Window, index: usize, tab: Tab) void {
     if (self.activeTab()) |v| setTabVisible(v, false);
     self.tabs.insertAssumeCapacity(index, tab);
+    self.tabs.items[index].row = .at(@floatFromInt(index));
     self.active = index;
-    if (self.tabs.items.len == 1) self.selection = 0;
+    if (self.tabs.items.len == 1) self.selection = .at(0);
     self.refresh();
+    self.revealActive();
     self.focusActive();
 }
 
@@ -304,6 +411,7 @@ pub fn selectTab(self: *Window, index: usize) void {
     setTabVisible(&self.tabs.items[self.active], false);
     self.active = index;
     self.refresh();
+    self.revealActive();
     self.focusActive();
 }
 
@@ -343,7 +451,12 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     for (self.tabs.items, 0..) |v, i| {
         if (v.id == active_id) self.active = i;
     }
+    self.selection.target = @floatFromInt(self.active);
+    if (!self.animates()) self.selection.finish();
+    self.syncRows();
+    self.revealActive();
     self.invalidateBar();
+    self.startMotion();
 }
 
 /// Move the tab with the given surface to a window of its own.
@@ -374,7 +487,11 @@ fn takeTab(self: *Window, index: usize) Tab {
     if (index < self.active or self.active == self.tabs.items.len) self.active -|= 1;
     if (self.tabs.items.len > 0) {
         self.refresh();
+        self.revealActive();
         if (was_active) self.focusActive();
+    } else {
+        // It's about to be destroyed, or not ours.
+        self.forgetLayout();
     }
     return tab;
 }
@@ -467,14 +584,15 @@ pub fn closeSurface(self: *Window, surface: *Surface) !void {
         break :next loc.tab.tree.nodes[handle.idx()].leaf;
     };
     const tree = try loc.tab.tree.remove(alloc, loc.handle);
-    surface.setVisible(false);
     var old = loc.tab.tree;
     loc.tab.tree = tree;
     loc.tab.focused = next;
     self.refresh();
+    if (!surface.dying) surface.setVisible(false);
     if (loc.index == self.active) self.focusActive();
 
-    // This drops the last reference to the surface.
+    // This drops the last reference to the surface, unless it's still shown
+    // making room.
     old.deinit();
 }
 
@@ -536,7 +654,7 @@ pub fn newSplit(
     const alloc = self.app.core_app.alloc;
     if (self.locate(from) == null) return false;
 
-    const surface = try Surface.create(self, .split, self.contentRect(), null);
+    const surface = try Surface.create(self, .split, self.halfOf(from, direction), null);
     var insert = Tree.init(alloc, surface) catch |err| {
         surface.destroy();
         return err;
@@ -560,6 +678,19 @@ pub fn newSplit(
     self.refresh();
     self.focusActive();
     return true;
+}
+
+/// About what a new split will have, so that it starts out with that.
+fn halfOf(self: *const Window, from: *const Surface, direction: apprt.action.SplitDirection) c.RECT {
+    var rect = self.contentRect();
+    for (self.cards.items) |card| if (card.surface == from) {
+        rect = card.hole;
+    };
+    switch (direction) {
+        .left, .right => rect.right = rect.left + @divTrunc(rect.right - rect.left, 2),
+        .up, .down => rect.bottom = rect.top + @divTrunc(rect.bottom - rect.top, 2),
+    }
+    return rect;
 }
 
 pub fn gotoSplit(self: *Window, from: *Surface, to: apprt.action.GotoSplit) !bool {
@@ -642,12 +773,17 @@ pub fn surfaceFocused(self: *Window, surface: *Surface) void {
     loc.tab.focused = surface;
     syncDimming(loc.tab);
     self.titleChanged(surface);
+    if (loc.index == self.active) {
+        self.syncOutline(self.animates());
+        self.startMotion();
+    }
     if (self.hasCards()) _ = c.InvalidateRect(self.hwnd, null, 0);
 }
 
 pub fn titleChanged(self: *Window, surface: *const Surface) void {
     const loc = self.locate(surface) orelse return;
     self.invalidateBar();
+    self.updateTooltip();
     if (loc.index == self.active) self.updateTitle();
 }
 
@@ -699,12 +835,27 @@ fn clientRect(self: *const Window) c.RECT {
     return rect;
 }
 
-fn barVisible(self: *const Window) bool {
+/// Whether tabs are shown, wherever that is.
+fn tabsVisible(self: *const Window) bool {
     return switch (self.app.config.@"window-show-tab-bar") {
         .always => true,
         .auto => self.tabs.items.len > 1,
         .never => false,
     };
+}
+
+fn tabsAtSide(self: *const Window) bool {
+    return self.app.config.@"win32-tab-bar" == .side;
+}
+
+/// Whether tabs are in a bar at the top.
+fn barVisible(self: *const Window) bool {
+    return !self.tabsAtSide() and self.tabsVisible();
+}
+
+/// Whether tabs are in a panel at the side.
+fn panelVisible(self: *const Window) bool {
+    return self.tabsAtSide() and self.tabsVisible();
 }
 
 const Style = @FieldType(Config, "macos-titlebar-style");
@@ -728,7 +879,7 @@ fn titleRect(self: *const Window) c.RECT {
         .native, .hidden => 0,
         // Tabs take the place of the title.
         .transparent => self.scaled(if (self.barVisible()) strip_height else title_height),
-        .tabs => self.scaled(strip_height),
+        .tabs => self.scaled(if (self.tabsAtSide()) title_height else strip_height),
     };
     return rect;
 }
@@ -793,15 +944,103 @@ fn pillRect(self: *const Window) c.RECT {
 }
 
 fn newTabRect(self: *const Window) c.RECT {
+    if (self.tabsAtSide()) {
+        const panel = self.panelRect();
+        const pad = self.scaled(panel_pad);
+        const offset = @min(0, panel.right - self.panelWidth());
+        return .{
+            .left = offset + pad,
+            .top = panel.bottom - pad - self.scaled(row_height),
+            .right = offset + self.panelWidth() - pad,
+            .bottom = panel.bottom - pad,
+        };
+    }
     const pill = self.pillRect();
     const left = pill.right + self.scaled(strip_margin);
     return .{ .left = left, .top = pill.top, .right = left + pill.bottom - pill.top, .bottom = pill.bottom };
 }
 
-/// The area of the client that holds surfaces.
-fn contentRect(self: *const Window) c.RECT {
+/// The width of the side panel when it's all in view.
+fn panelWidth(self: *const Window) c_int {
+    const client = self.clientRect();
+    return std.math.clamp(
+        client.right - self.scaled(terminal_min_width),
+        @min(self.scaled(panel_min_width), @divTrunc(client.right, 3)),
+        self.scaled(panel_width),
+    );
+}
+
+/// The side panel, as much as is in view. It comes in from the left.
+fn panelRect(self: *const Window) c.RECT {
     var rect = self.clientRect();
     rect.top = self.barRect().bottom;
+    const width: f32 = @floatFromInt(self.panelWidth());
+    rect.right = @intFromFloat(@round(width * std.math.clamp(self.panel.value, 0, 1.2)));
+    return rect;
+}
+
+/// What's above the list of tabs in the side panel.
+fn listRect(self: *const Window) c.RECT {
+    const panel = self.panelRect();
+    const pad = self.scaled(panel_pad);
+
+    // All of it moves, rather than being uncovered.
+    const offset = @min(0, panel.right - self.panelWidth());
+    const top = panel.top + if (self.titleRect().bottom > 0) 0 else pad;
+    return .{
+        .left = offset + pad,
+        .top = top,
+        .right = offset + self.panelWidth() - pad,
+        .bottom = @max(top, self.newTabRect().top - self.scaled(row_gap)),
+    };
+}
+
+/// A position in the list as it's scrolled, in rows.
+fn rowRect(self: *const Window, position: f32) c.RECT {
+    const list = self.listRect();
+    const height = self.rowStride();
+    const top = list.top - self.panel_scroll +
+        @as(c_int, @intFromFloat(@round(position * @as(f32, @floatFromInt(height)))));
+    return .{
+        .left = list.left,
+        .top = top,
+        .right = list.right,
+        .bottom = top + self.scaled(row_height),
+    };
+}
+
+fn rowStride(self: *const Window) c_int {
+    return self.scaled(row_height) + self.scaled(row_gap);
+}
+
+fn maxPanelScroll(self: *const Window) c_int {
+    const list = self.listRect();
+    const rows: c_int = @intCast(self.tabs.items.len);
+    return @max(0, rows * self.rowStride() - self.scaled(row_gap) - (list.bottom - list.top));
+}
+
+fn setPanelScroll(self: *Window, value: c_int) void {
+    const scroll = std.math.clamp(value, 0, self.maxPanelScroll());
+    if (scroll == self.panel_scroll) return;
+    self.panel_scroll = scroll;
+    self.invalidateBar();
+    self.updateTooltip();
+}
+
+/// Scroll the selected tab in to view.
+fn revealActive(self: *Window) void {
+    const list = self.listRect();
+    const top = @as(c_int, @intCast(self.active)) * self.rowStride();
+    const bottom = top + self.scaled(row_height);
+    const view = list.bottom - list.top;
+    self.setPanelScroll(@max(@min(self.panel_scroll, top), bottom - view));
+}
+
+/// The area of the client that holds surfaces.
+pub fn contentRect(self: *const Window) c.RECT {
+    var rect = self.clientRect();
+    rect.top = self.barRect().bottom;
+    rect.left = self.panelRect().right;
     return rect;
 }
 
@@ -813,23 +1052,350 @@ pub fn refresh(self: *Window) void {
     _ = c.InvalidateRect(self.hwnd, null, 0);
 }
 
+//---------------------------------------------------------------
+// Motion
+
+/// Whether what changes now gets there over time. A window that isn't active
+/// only finishes what it's doing.
+pub fn animates(self: *const Window) bool {
+    if (self.app.motionStyle() == .off or self.minimized) return false;
+    if (c.IsWindowVisible(self.hwnd) == 0) return false;
+    return self.is_active or self.moving();
+}
+
+/// Whether panes or the side panel are moving.
+fn layoutMoving(self: *const Window) bool {
+    return self.layout.moving() or self.card_amount.moving() or self.panel.moving();
+}
+
+fn moving(self: *const Window) bool {
+    if (self.layoutMoving() or self.selection.moving() or self.outline_amount.moving()) return true;
+    for (self.tabs.items) |*tab| if (tab.row.moving()) return true;
+    return false;
+}
+
+fn startMotion(self: *Window) void {
+    // It's no longer where it was.
+    if (self.outline_amount.moving()) self.showOutline();
+    if (self.animating or !self.moving()) return;
+    self.last_frame = null;
+    self.started = Ticker.now();
+    self.animating = self.app.ticker.start();
+    if (!self.animating) self.finishMotion();
+}
+
+/// Whether to wait with moving until what has been made larger has been drawn.
+/// What's shown of it is the same until then.
+fn unprepared(self: *const Window, now: i64) bool {
+    if (self.last_frame != null or Ticker.milliseconds(self.started, now) > prepare_ms) return false;
+    for (self.cards.items) |card| {
+        if (card.surface.fit.moving and !card.surface.isPresented()) return true;
+    }
+    return false;
+}
+
+/// Have everything be where it's going to be.
+fn finishMotion(self: *Window) void {
+    self.layout.finish();
+    self.card_amount.finish();
+    self.panel.finish();
+    self.selection.finish();
+    self.outline_amount.finish();
+    for (self.tabs.items) |*tab| tab.row.finish();
+    self.arrange();
+    self.hideOutline();
+    self.bury();
+    _ = c.InvalidateRect(self.hwnd, null, 0);
+}
+
+/// A frame of animation. Returns whether another is wanted.
+pub fn frame(self: *Window) bool {
+    if (!self.animating) return false;
+    const now = Ticker.now();
+    if (self.unprepared(now)) return true;
+
+    // It was at rest until now, however long ago the last frame was.
+    const elapsed: f32 = if (self.last_frame) |v|
+        std.math.clamp(Ticker.milliseconds(v, now), 1, 50) / 1000
+    else
+        0.008;
+    self.last_frame = now;
+
+    const style = self.app.motionStyle();
+    const layout_moved = self.layoutMoving();
+    _ = self.layout.step(style, elapsed);
+    self.card_amount.step(style, elapsed);
+    self.panel.step(style, elapsed);
+    self.selection.step(style, elapsed);
+    self.outline_amount.step(style, elapsed);
+    for (self.tabs.items) |*tab| tab.row.step(style, elapsed);
+
+    if (layout_moved and !self.minimized) {
+        self.arrange();
+        self.awaitPanes();
+        _ = c.InvalidateRect(self.hwnd, null, 0);
+    } else {
+        self.invalidateBar();
+    }
+    const more = self.moving();
+    if (!more) {
+        self.animating = false;
+        // For the outline that's no longer in a window of its own.
+        _ = c.InvalidateRect(self.hwnd, null, 0);
+    }
+    _ = c.UpdateWindow(self.hwnd);
+    self.showOutline();
+    self.bury();
+    return more;
+}
+
+/// Wait until panes have been drawn where they are now, so that the gaps
+/// between them don't get ahead of them. It's fine if they don't make it.
+fn awaitPanes(self: *Window) void {
+    const start = Ticker.now();
+    for (self.cards.items) |card| {
+        while (card.surface.fit.moving and !card.surface.isPresented()) {
+            const left = await_ms - Ticker.milliseconds(start, Ticker.now());
+            if (left < 1) return;
+            _ = c.WaitForSingleObject(self.app.presented, @intFromFloat(left));
+        }
+    }
+}
+
+/// Set where each tab goes in the side panel.
+fn syncRows(self: *Window) void {
+    const dragged: ?struct { from: usize, to: usize } = dragged: {
+        if (self.drag != .row or !self.drag.row.moving) break :dragged null;
+        const from = self.tabIndex(self.drag.row.id) orelse break :dragged null;
+        break :dragged .{ .from = from, .to = self.drag.row.to };
+    };
+    const animated = self.panelVisible() and self.animates();
+    for (self.tabs.items, 0..) |*tab, i| {
+        const row = if (dragged) |v| row: {
+            // It's where the pointer has it.
+            if (i == v.from) continue;
+            const others = if (i > v.from) i - 1 else i;
+            break :row if (others >= v.to) others + 1 else others;
+        } else i;
+        tab.row.target = @floatFromInt(row);
+        if (!animated) tab.row.finish();
+    }
+}
+
+fn tabIndex(self: *const Window, id: u32) ?usize {
+    for (self.tabs.items, 0..) |tab, i| if (tab.id == id) return i;
+    return null;
+}
+
+/// Have the outline go to the pane with the focus.
+fn syncOutline(self: *Window, animated: bool) void {
+    const tab = self.activeTab() orelse return;
+    if (self.outlined == tab.focused) return;
+    const from = self.outlineRect();
+    self.outlined = tab.focused;
+    if (from == null or !animated or !self.is_active or
+        self.layout_tab != tab.id or self.card_amount.target == 0)
+    {
+        self.outline_amount.finish();
+        return;
+    }
+    self.outline_from = from.?;
+    self.outline_amount = .{ .value = 0, .target = 1 };
+}
+
+/// What the outline is around at the moment.
+fn outlineRect(self: *const Window) ?paint.Rect {
+    for (self.cards.items) |card| {
+        if (card.surface != self.outlined) continue;
+        const to: paint.Rect = .from(card.card);
+        if (!self.outline_amount.moving()) return if (card.shown) to else null;
+        // It may go past the pane, but not over anything else.
+        const r = self.outline_from.toward(to, self.outline_amount.value);
+        const within: paint.Rect = .from(insetRect(self.contentRect(), self.scaled(outline_focused)));
+        const left = @max(r.x, within.x);
+        const top = @max(r.y, within.y);
+        return .{
+            .x = left,
+            .y = top,
+            .w = @max(0, @min(r.x + r.w, within.x + within.w) - left),
+            .h = @max(0, @min(r.y + r.h, within.y + within.h) - top),
+        };
+    }
+    return null;
+}
+
+fn showOutline(self: *Window) void {
+    if (!self.outline_amount.moving() or self.minimized) return self.hideOutline();
+    const rect = self.outlineRect() orelse return self.hideOutline();
+    if (self.outline_window == null) {
+        self.outline_window = Outline.create(self.hwnd, self.app.hinstance) catch return;
+    }
+    self.outline_window.?.show(
+        self.hwnd,
+        rect,
+        @floatFromInt(self.scaled(card_radius)),
+        @floatFromInt(self.scaled(outline_focused)),
+        self.outlineColor(self.colors()),
+    );
+}
+
+fn hideOutline(self: *Window) void {
+    if (self.outline_window) |v| v.hide();
+}
+
+/// Destroy what the layout is done with, once it's safe to.
+fn bury(self: *Window) void {
+    if (self.layout.dead.items.len == 0) return;
+    for (self.layout.dead.items) |surface| surface.setVisible(false);
+    _ = c.PostMessageW(self.hwnd, WM_BURY, 0, 0);
+}
+
+fn onBury(self: *Window) void {
+    _ = c.KillTimer(self.hwnd, bury_timer);
+    if (self.app.modal > 0) {
+        _ = c.SetTimer(self.hwnd, bury_timer, bury_ms, null);
+        return;
+    }
+    while (self.layout.dead.pop()) |surface| surface.unref();
+}
+
+/// Called when the tabs are about to be destroyed.
+fn forgetLayout(self: *Window) void {
+    self.layout.reset();
+    self.layout_tab = 0;
+    self.cards.clearRetainingCapacity();
+    self.dividers.clearRetainingCapacity();
+    self.placements.clearRetainingCapacity();
+    self.outlined = null;
+    while (self.layout.dead.pop()) |surface| surface.unref();
+}
+
+//---------------------------------------------------------------
+// Panes
+
 fn relayout(self: *Window) void {
+    self.relayoutWith(self.animates());
+}
+
+/// Set where everything goes, and go there if not animated.
+fn relayoutWith(self: *Window, animated: bool) void {
+    const tab = self.activeTab() orelse return;
+    self.syncOutline(animated);
+
+    // Another tab is shown at once.
+    const same = self.layout_tab == tab.id;
+    if (!same) {
+        self.layout.reset();
+        self.layout_tab = tab.id;
+        self.outline_amount.finish();
+    }
+    self.layout.sync(&tab.tree, animated and same) catch |err| {
+        // It starts over the next time.
+        log.warn("error in layout err={}", .{err});
+        self.layout.reset();
+    };
+
+    self.card_amount.target = if (self.hasCards()) 1 else 0;
+    if (!animated or !same) self.card_amount.finish();
+    self.panel.target = if (self.panelVisible()) 1 else 0;
+    if (!animated) self.panel.finish();
+    self.selection.target = @floatFromInt(self.active);
+    if (!animated) self.selection.finish();
+    self.syncRows();
+    self.setPanelScroll(self.panel_scroll);
+
+    self.arrange();
+    self.bury();
+    self.startMotion();
+}
+
+/// Put everything where it is at the moment.
+fn arrange(self: *Window) void {
     self.dividers.clearRetainingCapacity();
     self.cards.clearRetainingCapacity();
     if (self.minimized) return;
     const tab = self.activeTab() orelse return;
     syncDimming(tab);
-    const content = self.contentRect();
-    if (tab.tree.zoomed) |zoomed| {
-        var it = tab.tree.iterator();
-        while (it.next()) |entry| if (entry.handle != zoomed) entry.view.setVisible(false);
-        self.layoutNode(tab, zoomed, content);
-    } else if (tab.tree.isSplit()) {
-        self.layoutNode(tab, .root, self.cardsRect(content));
-    } else {
-        self.layoutNode(tab, .root, content);
+    const inner = self.cardsRect(self.contentRect());
+    self.layout.arrange(
+        inner,
+        &self.placements,
+        &self.boundaries,
+    ) catch |err| {
+        log.warn("error in layout err={}", .{err});
+        return;
+    };
+
+    const alloc = self.app.core_app.alloc;
+    const half = @divTrunc(self.scaled(divider_width), 2);
+    for (self.boundaries.items) |v| {
+        var rect = v.area;
+        switch (v.axis) {
+            .horizontal => {
+                rect.left = v.at - half;
+                rect.right = v.at + half;
+            },
+            .vertical => {
+                rect.top = v.at - half;
+                rect.bottom = v.at + half;
+            },
+        }
+        self.dividers.append(alloc, .{
+            .rect = rect,
+            .handle = v.handle,
+            .layout = v.axis,
+            .area = v.area,
+        }) catch {};
+    }
+
+    const is_moving = self.layoutMoving();
+    const gap = self.partly(half);
+    const inset = gap + self.partly(self.scaled(card_inset));
+    for (self.placements.items) |v| {
+        const surface = v.view;
+        if (v.dying) surface.setDying();
+        const card = insetRect(v.area, gap);
+        const hole = insetRect(v.area, inset);
+        const shown = v.area.right - v.area.left > inset * 2 and
+            v.area.bottom - v.area.top > inset * 2;
+        self.cards.append(alloc, .{
+            .surface = surface,
+            .area = v.area,
+            .card = card,
+            .hole = hole,
+            .shown = shown,
+        }) catch {};
+
+        const fit: Surface.Fit = fit: {
+            if (v.vanishing) break :fit .{ .moving = is_moving, .frozen = true };
+            if (!is_moving) break :fit .{};
+            const target = insetRect(v.target, inset);
+            const width = target.right - target.left;
+            const height = target.bottom - target.top;
+            break :fit .{
+                .moving = true,
+                .max_width = inner.right - inner.left,
+                .max_height = inner.bottom - inner.top,
+                .target_width = width,
+                .target_height = height,
+                // What appears is uncovered, as it already has its size.
+                .min_width = if (v.appearing) width else @min(width, self.scaled(moving_min_width)),
+                .min_height = if (v.appearing) height else @min(height, self.scaled(moving_min_height)),
+            };
+        };
+        if (shown or !v.vanishing) surface.place(hole, fit);
+        surface.setVisible(shown);
     }
     self.repositionOverlays();
+}
+
+/// As much of a length as panes are cards.
+fn partly(self: *const Window, v: c_int) c_int {
+    return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * self.cardAmount()));
+}
+
+fn cardAmount(self: *const Window) f32 {
+    return std.math.clamp(self.card_amount.value, 0, 1);
 }
 
 /// Whether the panes of the active tab are cards. One that fills the window
@@ -843,7 +1409,7 @@ fn hasCards(self: *const Window) bool {
 /// The part of the content that's divided between the cards. They keep half of
 /// a gap to the edges of it.
 fn cardsRect(self: *const Window, content: c.RECT) c.RECT {
-    const band = self.scaled(card_margin) - @divTrunc(self.scaled(divider_width), 2);
+    const band = self.partly(self.scaled(card_margin) - @divTrunc(self.scaled(divider_width), 2));
     return .{
         .left = content.left + band,
         .top = content.top + if (self.barVisible() or self.titleRect().bottom > 0) 0 else band,
@@ -859,61 +1425,6 @@ fn insetRect(rect: c.RECT, by: c_int) c.RECT {
         .right = @max(rect.left + by + 1, rect.right - by),
         .bottom = @max(rect.top + by + 1, rect.bottom - by),
     };
-}
-
-fn layoutNode(self: *Window, tab: *Tab, handle: Tree.Node.Handle, area: c.RECT) void {
-    switch (tab.tree.nodes[handle.idx()]) {
-        .leaf => |surface| {
-            if (self.hasCards()) {
-                const card = insetRect(area, @divTrunc(self.scaled(divider_width), 2));
-                const hole = insetRect(card, self.scaled(card_inset));
-                self.cards.append(self.app.core_app.alloc, .{
-                    .surface = surface,
-                    .area = area,
-                    .card = card,
-                    .hole = hole,
-                }) catch {};
-                surface.place(hole);
-            } else {
-                surface.place(area);
-            }
-            surface.setVisible(true);
-        },
-
-        .split => |split| {
-            const half = @divTrunc(self.scaled(divider_width), 2);
-            const horizontal = split.layout == .horizontal;
-            const start, const end = if (horizontal)
-                .{ area.left, area.right }
-            else
-                .{ area.top, area.bottom };
-            const ratio: f32 = split.ratio;
-            const at = start + @as(c_int, @intFromFloat(ratio * @as(f32, @floatFromInt(@max(0, end - start)))));
-
-            var first = area;
-            var second = area;
-            var rect = area;
-            if (horizontal) {
-                first.right = at;
-                second.left = at;
-                rect.left = at - half;
-                rect.right = at + half;
-            } else {
-                first.bottom = at;
-                second.top = at;
-                rect.top = at - half;
-                rect.bottom = at + half;
-            }
-            self.dividers.append(self.app.core_app.alloc, .{
-                .rect = rect,
-                .handle = handle,
-                .layout = split.layout,
-                .area = area,
-            }) catch {};
-            self.layoutNode(tab, split.left, first);
-            self.layoutNode(tab, split.right, second);
-        },
-    }
 }
 
 /// Dim the splits that don't have the focus.
@@ -941,6 +1452,7 @@ pub fn setSurfaceSize(self: *Window, surface: *const Surface, width: u32, height
     };
     rect.right += surface.scrollbarWidth();
     rect.bottom += self.barRect().bottom;
+    if (self.panelVisible()) rect.right += self.scaled(panel_width);
     self.adjustRect(&rect);
     _ = c.SetWindowPos(
         self.hwnd,
@@ -1018,16 +1530,55 @@ pub fn present(self: *Window, surface: *Surface) void {
 // Appearance
 
 pub fn configChanged(self: *Window) void {
+    // Opaque or not, it's only opacity that can be toggled off.
+    if (!self.canToggleOpacity()) self.force_opaque = false;
     self.syncAppearance();
     self.updateFont();
     for (self.tabs.items) |*tab| {
         var it = tab.tree.iterator();
         while (it.next()) |entry| {
             entry.view.configChanged();
+            entry.view.syncBackground();
             if (self.force_opaque) entry.view.updateOpacity();
+            if (entry.view.search) |v| v.lookChanged();
         }
     }
+    if (self.palette) |v| v.lookChanged();
+    self.drag = .none;
     self.refresh();
+    self.revealActive();
+}
+
+/// Called when we have, or have to, become glass or stop being that.
+pub fn lookChanged(self: *Window) void {
+    self.syncTransparency();
+    for (self.tabs.items) |*tab| {
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| {
+            entry.view.syncBackground();
+            if (entry.view.search) |v| v.lookChanged();
+        }
+    }
+    if (self.palette) |v| v.lookChanged();
+    _ = c.RedrawWindow(self.hwnd, null, null, c.RDW_INVALIDATE | c.RDW_ALLCHILDREN);
+}
+
+pub fn look(self: *const Window) glass.Look {
+    const result = self.app.look();
+    return if (result == .frost and self.force_opaque) .solid else result;
+}
+
+fn opacity(self: *const Window) glass.Opacity {
+    return .init(&self.app.config, if (self.force_opaque) .solid else self.look());
+}
+
+/// What our surfaces use for the background, see `Surface.background`.
+pub fn background(self: *const Window) u64 {
+    return @bitCast(glass.Background.init(&self.app.config, self.look()));
+}
+
+fn colors(self: *const Window) paint.Palette {
+    return .init(&self.app.config);
 }
 
 /// Match the frame to the configured theme.
@@ -1077,13 +1628,20 @@ fn syncAppearance(self: *Window) void {
 
 /// The opacity (0 to 255) of the terminal background.
 pub fn backgroundOpacity(self: *const Window) u8 {
-    if (self.force_opaque) return 255;
-    return @intFromFloat(@round(std.math.clamp(self.app.config.@"background-opacity", 0, 1) * 255));
+    return self.opacity().card;
+}
+
+fn canToggleOpacity(self: *const Window) bool {
+    return self.app.config.@"win32-glass" or self.app.config.@"background-opacity" < 1;
 }
 
 pub fn toggleOpacity(self: *Window) bool {
-    if (self.app.config.@"background-opacity" >= 1) return false;
+    if (!self.canToggleOpacity()) return false;
     self.force_opaque = !self.force_opaque;
+    if (self.app.config.@"win32-glass") {
+        self.lookChanged();
+        return true;
+    }
     self.syncTransparency();
 
     for (self.tabs.items) |*tab| {
@@ -1096,41 +1654,28 @@ pub fn toggleOpacity(self: *Window) bool {
 
 /// Have the compositor use the alpha channel of what's drawn, or not.
 fn syncTransparency(self: *Window) void {
-    const transparent = self.backgroundOpacity() < 255;
+    const is_frost = self.look() == .frost;
 
-    // An empty region enables alpha without any blur. Since Windows 8 the
-    // blur this is named for doesn't exist anyway.
-    const region = if (transparent) c.CreateRectRgn(0, 0, -1, -1) else null;
-    defer if (region) |v| {
-        _ = c.DeleteObject(v);
-    };
-    _ = c.DwmEnableBlurBehindWindow(self.hwnd, &.{
-        .dwFlags = c.DWM_BB_ENABLE | @as(u32, if (transparent) c.DWM_BB_BLURREGION else 0),
-        .fEnable = @intFromBool(transparent),
-        .hRgnBlur = region,
-    });
+    // What's shown is translucent until it's drawn again.
+    if (self.frosted and !is_frost and c.IsWindowVisible(self.hwnd) != 0 and
+        c.SetTimer(self.hwnd, backing_timer, backing_ms, null) != 0) return;
+    self.applyTransparency();
+}
 
-    // The documented backdrops (DWMWA_SYSTEMBACKDROP_TYPE) are opaque
-    // materials that don't show what's behind the window. This is
-    // undocumented, so look it up and do without if it's ever removed.
-    const blur = transparent and switch (self.app.config.@"background-blur") {
-        .false => false,
-        .radius => |v| v > 0,
-        .true, .@"macos-glass-regular", .@"macos-glass-clear" => true,
-    };
-    const user32 = c.GetModuleHandleW(c.L("user32.dll")) orelse return;
-    const proc = c.GetProcAddress(user32, "SetWindowCompositionAttribute") orelse return;
-    const func: *const fn (
-        c.HWND,
-        *const c.WINDOWCOMPOSITIONATTRIBDATA,
-    ) callconv(.winapi) c.BOOL = @ptrCast(@alignCast(proc));
-    const policy: c.ACCENT_POLICY = .{
-        .state = if (blur) c.ACCENT_ENABLE_BLURBEHIND else c.ACCENT_DISABLED,
-    };
-    _ = func(self.hwnd, &.{
-        .attribute = c.WCA_ACCENT_POLICY,
-        .data = &policy,
-        .size = @sizeOf(c.ACCENT_POLICY),
+fn applyTransparency(self: *Window) void {
+    _ = c.KillTimer(self.hwnd, backing_timer);
+    const current = self.look();
+    self.frosted = current == .frost;
+    glass.setBacking(self.hwnd, switch (current) {
+        .frost => .{ .frost = self.colors().bg },
+        .solid => .solid,
+        .off => if (self.backgroundOpacity() == 255)
+            .solid
+        else switch (self.app.config.@"background-blur") {
+            .false => .clear,
+            .radius => |v| if (v > 0) .blur else .clear,
+            .true, .@"macos-glass-regular", .@"macos-glass-clear" => .blur,
+        },
     });
 }
 
@@ -1154,26 +1699,8 @@ fn updateFont(self: *Window) void {
 fn invalidateBar(self: *Window) void {
     const rect = self.barRect();
     if (rect.bottom > 0) _ = c.InvalidateRect(self.hwnd, &rect, 0);
-
-    const target: f32 = @floatFromInt(self.active);
-    if (self.selection != target and !self.animating) {
-        self.animating = c.SetTimer(self.hwnd, animation_timer, animation_ms, null) != 0;
-    }
-}
-
-/// Move the selection a step closer to the active tab.
-fn animate(self: *Window) void {
-    const target: f32 = @floatFromInt(self.active);
-    const remaining = target - self.selection;
-    if (@abs(remaining) < 0.01) {
-        self.selection = target;
-        self.animating = false;
-        _ = c.KillTimer(self.hwnd, animation_timer);
-    } else {
-        self.selection += remaining * 0.3;
-    }
-    const rect = self.barRect();
-    _ = c.InvalidateRect(self.hwnd, &rect, 0);
+    const panel = self.panelRect();
+    if (panel.right > 0) _ = c.InvalidateRect(self.hwnd, &panel, 0);
 }
 
 fn tabWidth(self: *const Window) f32 {
@@ -1190,6 +1717,7 @@ fn tabArea(self: *const Window, position: f32) paint.Rect {
 }
 
 fn tabRect(self: *const Window, index: usize) c.RECT {
+    if (self.tabsAtSide()) return self.rowRect(@floatFromInt(index));
     const r = self.tabArea(@floatFromInt(index));
     return .{
         .left = @intFromFloat(r.x),
@@ -1202,9 +1730,22 @@ fn tabRect(self: *const Window, index: usize) c.RECT {
 fn closeRect(self: *const Window, index: usize) c.RECT {
     const tab = self.tabRect(index);
     const size = self.scaled(close_size);
-    const top = tab.top + @divTrunc(tab.bottom - tab.top - size, 2);
-    const left = tab.left + @divTrunc(tab.bottom - tab.top - size, 2);
+    const space = @divTrunc(tab.bottom - tab.top - size, 2);
+    const top = tab.top + space;
+    const left = if (self.tabsAtSide()) tab.right - space - size else tab.left + space;
     return .{ .left = left, .top = top, .right = left + size, .bottom = top + size };
+}
+
+/// Where the title of a row goes.
+fn rowLabelRect(self: *const Window, row: c.RECT, hovered: bool) c.RECT {
+    const pad = self.scaled(row_pad);
+    const side = row.bottom - row.top;
+    return .{
+        .left = row.left + pad,
+        .top = row.top,
+        .right = @max(row.left + pad, if (hovered) row.right - side else row.right - pad),
+        .bottom = row.bottom,
+    };
 }
 
 fn onPaint(self: *Window) void {
@@ -1213,24 +1754,38 @@ fn onPaint(self: *Window) void {
     defer _ = c.EndPaint(self.hwnd, &ps);
 
     const palette: paint.Palette = .init(&self.app.config);
-    if (self.hasCards()) self.paintCards(dc, palette);
+    if (self.cardAmount() > 0 or self.layoutMoving()) self.paintCards(dc, palette);
+    self.paintPanel(dc, palette);
 
     const bar = self.barRect();
     if (bar.bottom == 0) return;
     var buf = paint.Buffer.begin(dc, bar) orelse return;
     defer buf.end();
-    self.paintBase(&buf, palette);
+    self.paintBase(&buf, palette, .bar);
     if (self.buttonsVisible()) self.paintButtons(buf, palette);
     if (self.barVisible()) self.paintTabs(buf, palette) else self.paintTitle(buf, palette);
 }
 
+const Base = enum { bar, gap };
+
 /// Cards are on something that's a little further back than they are.
-fn paintBase(self: *const Window, buf: *paint.Buffer, palette: paint.Palette) void {
-    const opacity = self.backgroundOpacity();
-    if (!self.hasCards()) return buf.base(palette.bg, opacity);
+fn paintBase(self: *const Window, buf: *paint.Buffer, palette: paint.Palette, base: Base) void {
+    const color, const alpha = self.baseColor(palette, base);
+    buf.base(color, alpha);
+}
+
+fn baseColor(self: *const Window, palette: paint.Palette, base: Base) struct { paint.Rgb, u8 } {
+    const alpha = self.opacity();
+    if (base == .bar and self.look() == .frost) return .{ palette.bg, alpha.bar };
 
     // More of what's behind the window is seen between cards.
-    buf.base(palette.backdrop, if (opacity == 255) 255 else @intCast(@as(u32, opacity) * 7 / 10));
+    const amount = self.cardAmount();
+    const card: f32 = @floatFromInt(alpha.card);
+    const gap: f32 = @floatFromInt(alpha.gap);
+    return .{
+        palette.bg.mix(palette.backdrop, @intFromFloat(@round(amount * 255))),
+        @intFromFloat(@round(card + (gap - card) * amount)),
+    };
 }
 
 fn paintCards(self: *Window, dc: c.HDC, palette: paint.Palette) void {
@@ -1243,12 +1798,19 @@ fn paintCards(self: *Window, dc: c.HDC, palette: paint.Palette) void {
         .{ .left = inner.right, .top = inner.top, .right = content.right, .bottom = inner.bottom },
     }) |rect| {
         var buf = paint.Buffer.begin(dc, rect) orelse continue;
-        self.paintBase(&buf, palette);
+        self.paintBase(&buf, palette, .gap);
         buf.end();
     }
 
     const focused = self.activeSurface();
     for (self.cards.items) |card| {
+        if (!card.shown) {
+            var buf = paint.Buffer.begin(dc, card.area) orelse continue;
+            defer buf.end();
+            self.paintBase(&buf, palette, .gap);
+            continue;
+        }
+
         // Only what's around the terminal, which covers the rest. Filling
         // all of it would be slow.
         const a = card.area;
@@ -1261,8 +1823,15 @@ fn paintCards(self: *Window, dc: c.HDC, palette: paint.Palette) void {
         }) |rect| {
             var buf = paint.Buffer.begin(dc, rect) orelse continue;
             defer buf.end();
-            self.paintBase(&buf, palette);
-            self.paintCard(buf, rect, card.card, palette, card.surface == focused);
+            self.paintBase(&buf, palette, .gap);
+            self.paintCard(
+                buf,
+                rect,
+                card.card,
+                palette,
+                // While it's on its way it's in a window of its own.
+                card.surface == focused and !self.outline_amount.moving(),
+            );
         }
     }
 }
@@ -1276,21 +1845,30 @@ fn paintCard(
     palette: paint.Palette,
     focused: bool,
 ) void {
-    const radius: f32 = @floatFromInt(self.scaled(card_radius));
+    const amount = self.cardAmount();
+    const radius: f32 = @as(f32, @floatFromInt(self.scaled(card_radius))) * amount;
     var r: paint.Rect = .from(card);
     r.x -= @floatFromInt(part.left);
     r.y -= @floatFromInt(part.top);
     buf.replaceRound(r, radius, palette.bg, self.backgroundOpacity());
+    if (self.look() != .off) {
+        const dark = palette.bg.isDark();
+        const light: paint.Rgb = if (dark)
+            .{ .r = 215, .g = 215, .b = 215 }
+        else
+            .{ .r = 255, .g = 255, .b = 255 };
+        const thickness: f32 = @floatFromInt(@max(1, self.scaled(1)));
+        buf.highlight(r, radius, thickness, light, amount * @as(f32, if (dark) 0.38 else 0.85));
+    }
 
     // The outline is in the gap around the card, and takes nothing of it.
     const thickness: f32 = @floatFromInt(self.scaled(if (focused) outline_focused else outline));
-    const color = if (!focused)
-        palette.divider
-    else if (self.is_active)
-        palette.accent
-    else
-        palette.accent.mix(palette.backdrop, 128);
+    const color = if (focused) self.outlineColor(palette) else palette.divider;
     buf.outline(r.inset(-thickness), radius + thickness, thickness, color);
+}
+
+fn outlineColor(self: *const Window, palette: paint.Palette) paint.Rgb {
+    return if (self.is_active) palette.accent else palette.accent.mix(palette.backdrop, 128);
 }
 
 /// Scales alpha down for windows that aren't active.
@@ -1364,7 +1942,7 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
     // The selection is a smaller capsule, concentric with the outer one.
     const inset: f32 = @floatFromInt(self.scaled(pill_inset));
     const last: f32 = @floatFromInt(self.tabs.items.len - 1);
-    const selection = self.tabArea(std.math.clamp(self.selection, 0, last)).inset(inset);
+    const selection = self.tabArea(std.math.clamp(self.selection.value, 0, last)).inset(inset);
     if (palette.bg.isDark()) {
         buf.glass(selection, selection.h / 2, palette.fg, 0.07 + 0.08 * strength);
     } else {
@@ -1373,7 +1951,7 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
         buf.ring(selection, selection.h / 2, palette.fg, 0.05, 0.16);
     }
 
-    for (self.tabs.items, 0..) |*tab, i| {
+    for (0..self.tabs.items.len) |i| {
         const active = i == self.active;
         const hovered = switch (self.hover) {
             .tab, .tab_close => |v| v == i,
@@ -1386,7 +1964,7 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
         }
 
         // Between tabs that are both plain.
-        if (i > 0 and !active and i - 1 != self.active and !self.animating) {
+        if (i > 0 and !active and i - 1 != self.active and !self.selection.moving()) {
             buf.round(.{ .x = @floor(area.x), .y = area.y + area.h * 0.3, .w = 1, .h = area.h * 0.4 }, 0, palette.fg, 0.14);
         }
 
@@ -1397,11 +1975,8 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
         label.left += side;
         label.right -= side;
         var number: [8]u8 = undefined;
-        const title = std.mem.trim(u8, tab.title(), " ");
         if (label.right > label.left) buf.blendText(
-            // A fixed blank title is a way of hiding the one of the window, but
-            // tabs need something to tell them apart.
-            if (title.len > 0) title else std.fmt.bufPrint(&number, "{}", .{i + 1}) catch "",
+            self.tabLabel(i, &number),
             label,
             if (active) self.font_bold else self.font,
             palette.fg,
@@ -1421,6 +1996,216 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
     const r: paint.Rect = .from(plus);
     buf.glass(r, r.w / 2, palette.fg, if (self.hover == .new_tab) 0.18 else 0.09);
     buf.blendText(paint.icon.add, plus, self.font_icon, palette.fg, 0.8 * strength, c.DT_CENTER);
+}
+
+/// The side panel, with a row for each tab.
+fn paintPanel(self: *Window, dc: c.HDC, palette: paint.Palette) void {
+    const panel = self.panelRect();
+    var buf = paint.Buffer.begin(dc, panel) orelse return;
+    defer buf.end();
+    self.paintBase(&buf, palette, .bar);
+
+    const move = struct {
+        fn move(rect: c.RECT, origin: c.RECT) c.RECT {
+            return .{
+                .left = rect.left - origin.left,
+                .top = rect.top - origin.top,
+                .right = rect.right - origin.left,
+                .bottom = rect.bottom - origin.top,
+            };
+        }
+    }.move;
+
+    // A color that's the opposite of the text needs no help to be seen.
+    const contrast = self.app.high_contrast;
+    const strength: f32 = if (contrast) 1 else self.emphasis();
+    const radius: f32 = @floatFromInt(self.scaled(row_radius));
+
+    const plus = self.newTabRect();
+    const plus_at = move(plus, panel);
+    if (self.hover == .new_tab) {
+        buf.glass(.from(plus_at), radius, palette.fg, if (contrast) 0.3 else 0.1);
+    }
+    buf.blendText(paint.icon.add, plus_at, self.font_icon, palette.fg, 0.8 * strength, c.DT_CENTER);
+
+    // Between this and the terminal. Cards are their own.
+    var line = move(panel, panel);
+    line.left = line.right - 1;
+    buf.round(.from(line), 0, palette.fg, if (contrast) 1 else 0.12);
+
+    // The thumb of what's scrolled, beside the rows.
+    const list = self.listRect();
+    const max = self.maxPanelScroll();
+    if (max > 0) {
+        const list_at = move(list, panel);
+        const view = list.bottom - list.top;
+        const height = @max(self.scaled(24), @divTrunc(view * view, view + max));
+        const top = list_at.top + @divTrunc((view - height) * self.panel_scroll, max);
+        const left = list_at.right + @divTrunc(self.scaled(panel_pad - thumb_width), 2);
+        buf.round(.from(.{
+            .left = left,
+            .top = top,
+            .right = left + self.scaled(thumb_width),
+            .bottom = top + height,
+        }), @floatFromInt(self.scaled(thumb_width)), palette.fg, 0.35);
+    }
+
+    // Rows that are scrolled out of the list are cut off.
+    var rows = paint.Buffer.begin(buf.dc, move(list, panel)) orelse return;
+    defer rows.end();
+    self.paintBase(&rows, palette, .bar);
+    self.paintRows(rows, list, palette, strength, contrast);
+}
+
+fn paintRows(
+    self: *Window,
+    buf: paint.Buffer,
+    list: c.RECT,
+    palette: paint.Palette,
+    strength: f32,
+    contrast: bool,
+) void {
+    if (self.tabs.items.len == 0) return;
+    const radius: f32 = @floatFromInt(self.scaled(row_radius));
+    const dragged: ?usize = switch (self.drag) {
+        .row => |v| if (v.moving) self.tabIndex(v.id) else null,
+        else => null,
+    };
+    const place = struct {
+        fn place(rect: c.RECT, origin: c.RECT) c.RECT {
+            return .{
+                .left = rect.left - origin.left,
+                .top = rect.top - origin.top,
+                .right = rect.right - origin.left,
+                .bottom = rect.bottom - origin.top,
+            };
+        }
+    }.place;
+
+    const last: f32 = @floatFromInt(self.tabs.items.len - 1);
+    const at = if (dragged != null and dragged.? == self.active)
+        self.tabs.items[self.active].row.value
+    else
+        std.math.clamp(self.selection.value, 0, last);
+    const selection = place(self.rowRect(at), list);
+    if (contrast) {
+        buf.round(.from(selection), radius, palette.fg, 1);
+    } else {
+        // As the selected row of the command palette.
+        buf.glass(.from(selection), radius, palette.fg, if (self.is_active) 0.14 else 0.10);
+    }
+
+    for (self.tabs.items, 0..) |*tab, i| {
+        const row = place(self.rowRect(tab.row.value), list);
+        if (row.bottom <= 0 or row.top >= list.bottom - list.top) continue;
+        const active = i == self.active;
+        const hovered = dragged == null and switch (self.hover) {
+            .tab, .tab_close => |v| v == i,
+            else => false,
+        };
+        if (hovered and !active) buf.round(.from(row), radius, palette.fg, if (contrast) 0.25 else 0.05);
+
+        const color = if (contrast and active) palette.bg else palette.fg;
+        const alpha: f32 = if (contrast) 1 else if (active) 0.95 else 0.65;
+        const label = self.rowLabelRect(row, hovered);
+        var number: [8]u8 = undefined;
+        if (label.right > label.left) buf.blendText(
+            self.tabLabel(i, &number),
+            label,
+            if (active) self.font_bold else self.font,
+            color,
+            alpha * @max(strength, 0.6),
+            c.DT_LEFT,
+        );
+
+        if (hovered) {
+            const on_close = self.hover.eql(.{ .tab_close = i });
+            const close = place(self.closeRect(i), list);
+            const r: paint.Rect = .from(close);
+            if (on_close) buf.round(r, r.w / 2, color, 0.16);
+            buf.blendText(
+                paint.icon.cancel,
+                close,
+                self.font_icon,
+                color,
+                if (on_close or contrast) 0.95 else 0.6,
+                c.DT_CENTER,
+            );
+        }
+    }
+}
+
+//---------------------------------------------------------------
+// Tooltip of the side panel
+
+/// Show the title of the tab that's hovered, if there's no room for it.
+fn updateTooltip(self: *Window) void {
+    const index: ?usize = index: {
+        if (!self.panelVisible() or self.drag != .none) break :index null;
+        const i = switch (self.hover) {
+            .tab => |v| v,
+            else => break :index null,
+        };
+        if (i >= self.tabs.items.len) break :index null;
+        var number: [8]u8 = undefined;
+        const label = self.rowLabelRect(self.tabRect(i), true);
+        const dc = c.GetDC(self.hwnd) orelse break :index null;
+        defer _ = c.ReleaseDC(self.hwnd, dc);
+        const width = paint.textWidth(
+            dc,
+            self.tabLabel(i, &number),
+            if (i == self.active) self.font_bold else self.font,
+        );
+        break :index if (width > label.right - label.left) i else null;
+    };
+    if (index == null and self.tooltip_tab == null) return;
+    self.tooltip_tab = index;
+    const tooltip = self.ensureTooltip() orelse return;
+
+    var tool: c.TOOLINFOW = .{ .hwnd = self.hwnd, .uId = 1 };
+    const alloc = self.app.core_app.alloc;
+    const i = index orelse {
+        tool.lpszText = c.L("");
+        _ = c.SendMessageW(tooltip, c.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&tool)));
+        _ = c.SendMessageW(tooltip, c.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&tool)));
+        _ = c.SendMessageW(tooltip, c.TTM_POP, 0, 0);
+        return;
+    };
+    var number: [8]u8 = undefined;
+    const text = std.unicode.wtf8ToWtf16LeAllocZ(alloc, self.tabLabel(i, &number)) catch return;
+    defer alloc.free(text);
+    tool.lpszText = text;
+    tool.rect = self.tabRect(i);
+    _ = c.SendMessageW(tooltip, c.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&tool)));
+    _ = c.SendMessageW(tooltip, c.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&tool)));
+}
+
+/// It's destroyed along with us.
+fn ensureTooltip(self: *Window) ?c.HWND {
+    if (self.tooltip) |v| return v;
+    const hwnd = c.CreateWindowExW(
+        0,
+        c.L("tooltips_class32"),
+        c.L(""),
+        c.WS_POPUP | c.TTS_ALWAYSTIP | c.TTS_NOPREFIX,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        self.hwnd,
+        null,
+        self.app.hinstance,
+        null,
+    ) orelse return null;
+    const tool: c.TOOLINFOW = .{
+        .uFlags = c.TTF_SUBCLASS,
+        .hwnd = self.hwnd,
+        .uId = 1,
+        .lpszText = c.L(""),
+    };
+    _ = c.SendMessageW(hwnd, c.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&tool)));
+    self.tooltip = hwnd;
+    return hwnd;
 }
 
 //---------------------------------------------------------------
@@ -1458,6 +2243,19 @@ fn hitTest(self: *const Window, x: c_int, y: c_int) Hit {
             if (contains(self.newTabRect(), x, y)) return .new_tab;
         }
         return .caption;
+    }
+    if (contains(self.panelRect(), x, y)) {
+        if (contains(self.newTabRect(), x, y)) return .new_tab;
+        const list = self.listRect();
+        if (contains(list, x, y)) {
+            const index: usize = @intCast(@divTrunc(y - list.top + self.panel_scroll, self.rowStride()));
+            if (index < self.tabs.items.len) {
+                if (contains(self.closeRect(index), x, y)) return .{ .tab_close = index };
+                return .{ .tab = index };
+            }
+        }
+        // There's nothing else to move the window by without a title bar.
+        return if (self.titleRect().bottom == 0) .caption else .panel;
     }
     for (self.dividers.items, 0..) |divider, i| {
         if (contains(divider.rect, x, y)) return .{ .divider = i };
@@ -1499,6 +2297,13 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
                 self.moveTabTo(self.active, to);
             }
         },
+        .row => |*drag| {
+            if (!drag.moving and @abs(y - drag.start_y) > self.scaled(4)) {
+                drag.moving = true;
+                self.updateTooltip();
+            }
+            if (drag.moving) self.dragRow(y);
+        },
         .divider => |index| if (index < self.dividers.items.len) {
             const divider = self.dividers.items[index];
             const tab = self.activeTab() orelse return;
@@ -1511,7 +2316,9 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
             const ratio = @as(f32, @floatFromInt(pos - start)) /
                 @as(f32, @floatFromInt(space));
             tab.tree.resizeInPlace(divider.handle, @floatCast(std.math.clamp(ratio, 0.05, 0.95)));
-            self.relayout();
+
+            // It's where the pointer has it.
+            self.relayoutWith(false);
             _ = c.InvalidateRect(self.hwnd, null, 0);
         },
     }
@@ -1519,10 +2326,53 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
     self.setHover(self.hitTest(x, y));
 }
 
+/// Have the row that's held be where the pointer is.
+fn dragRow(self: *Window, y: c_int) void {
+    const index = self.tabIndex(self.drag.row.id) orelse {
+        self.drag = .none;
+        return;
+    };
+    const list = self.listRect();
+
+    // Keep going at the ends of a list that's scrolled.
+    const step = @divTrunc(self.rowStride(), 4);
+    if (y < list.top) self.setPanelScroll(self.panel_scroll - step);
+    if (y >= list.bottom) self.setPanelScroll(self.panel_scroll + step);
+
+    const last: f32 = @floatFromInt(self.tabs.items.len - 1);
+    const offset: f32 = @floatFromInt(y - self.drag.row.grab - list.top + self.panel_scroll);
+    const position = std.math.clamp(offset / @as(f32, @floatFromInt(self.rowStride())), 0, last);
+    self.tabs.items[index].row = .at(position);
+    self.drag.row.to = @intFromFloat(@round(position));
+    self.syncRows();
+    self.invalidateBar();
+    self.startMotion();
+}
+
+/// Let go of the row that's held, if any.
+fn dropRow(self: *Window, commit: bool) void {
+    const drag = switch (self.drag) {
+        .row => |v| v,
+        else => return,
+    };
+    self.drag = .none;
+    if (!drag.moving) return;
+    const index = self.tabIndex(drag.id) orelse return;
+    if (index == self.active) {
+        // The selection was moved along with it.
+        self.selection.value = self.tabs.items[index].row.value;
+        self.selection.velocity = 0;
+    }
+    if (commit and drag.to < self.tabs.items.len) self.moveTabTo(index, drag.to);
+    self.relayout();
+    self.invalidateBar();
+}
+
 fn setHover(self: *Window, hover: Hit) void {
     if (hover.eql(self.hover)) return;
     self.hover = hover;
     self.invalidateBar();
+    self.updateTooltip();
 }
 
 /// The button a non-client message is about.
@@ -1553,8 +2403,17 @@ pub fn inResizeBand(self: *const Window, y: c_int) bool {
 
 fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
     switch (self.hitTest(x, y)) {
-        .none, .caption, .button => {},
-        .tab => |i| {
+        .none, .caption, .button, .panel => {},
+        .tab => |i| if (self.tabsAtSide()) {
+            self.selectTab(i);
+            self.drag = .{ .row = .{
+                .id = self.tabs.items[i].id,
+                .grab = y - self.tabRect(i).top,
+                .start_y = y,
+                .to = i,
+            } };
+            _ = c.SetCapture(self.hwnd);
+        } else {
             self.selectTab(i);
             self.drag = .{ .tab = .{ .start_x = x, .start_y = y } };
             _ = c.SetCapture(self.hwnd);
@@ -1621,7 +2480,12 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
 
         c.WM_DESTROY => self.deinit(),
         c.WM_PAINT => self.onPaint(),
-        c.WM_TIMER => if (wparam == animation_timer) self.animate(),
+        c.WM_TIMER => switch (wparam) {
+            bury_timer => self.onBury(),
+            backing_timer => self.applyTransparency(),
+            else => return null,
+        },
+        WM_BURY => self.onBury(),
 
         c.WM_NCCALCSIZE => {
             if (wparam == 0 or !self.customFrame()) return null;
@@ -1649,6 +2513,10 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
             const other: ?c.HWND = @ptrFromInt(bits);
             self.is_active = wparam & 0xFFFF != 0 or
                 (other != null and c.GetWindow(other.?, c.GW_OWNER) == self.hwnd);
+            if (!self.is_active) {
+                self.outline_amount.finish();
+                self.hideOutline();
+            }
             _ = c.InvalidateRect(self.hwnd, null, 0);
             return null;
         },
@@ -1716,6 +2584,7 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
                     while (it.next()) |entry| entry.view.setOccluded(!entry.view.visible);
                 }
                 self.relayout();
+                self.revealActive();
             }
             _ = c.InvalidateRect(self.hwnd, null, 0);
         },
@@ -1736,6 +2605,7 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
                     .bottom = std.math.lossyCast(c_int, limit.min_height),
                 };
                 rect.bottom += self.barRect().bottom;
+                if (self.panelVisible()) rect.right += self.panelWidth();
                 self.adjustRect(&rect);
                 info.ptMinTrackSize = .{ .x = rect.right - rect.left, .y = rect.bottom - rect.top };
             }
@@ -1761,8 +2631,14 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
         },
 
         c.WM_SETTINGCHANGE => {
+            self.app.systemChanged();
             self.syncAppearance();
             try self.app.colorSchemeChanged();
+        },
+
+        c.WM_POWERBROADCAST, c.WM_DISPLAYCHANGE, c.WM_THEMECHANGED, c.WM_SYSCOLORCHANGE => {
+            self.app.systemChanged();
+            return null;
         },
 
         c.WM_ACTIVATEAPP => self.app.core_app.focusEvent(wparam != 0),
@@ -1793,16 +2669,27 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
         c.WM_MOUSEMOVE => self.onMouseMove(x, y),
         c.WM_MOUSELEAVE => {
             self.tracking_leave = false;
-            self.hover = .none;
-            self.invalidateBar();
+            self.setHover(.none);
+        },
+        c.WM_MOUSEWHEEL => {
+            var point: c.POINT = .{ .x = x, .y = y };
+            _ = c.ScreenToClient(self.hwnd, &point);
+            if (!contains(self.panelRect(), point.x, point.y)) return null;
+            const delta: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+            self.setPanelScroll(self.panel_scroll - @divTrunc(@as(c_int, delta) * self.rowStride(), 60));
+            self.setHover(self.hitTest(point.x, point.y));
         },
         c.WM_LBUTTONDOWN => try self.onLeftDown(x, y),
         c.WM_LBUTTONDBLCLK => try self.onDoubleClick(x, y),
         c.WM_LBUTTONUP => {
+            self.dropRow(true);
             self.drag = .none;
             if (c.GetCapture() == self.hwnd) _ = c.ReleaseCapture();
         },
-        c.WM_CAPTURECHANGED => self.drag = .none,
+        c.WM_CAPTURECHANGED => {
+            self.dropRow(false);
+            self.drag = .none;
+        },
         c.WM_MBUTTONDOWN => switch (self.hitTest(x, y)) {
             .tab, .tab_close => |i| self.postCloseTab(self.tabs.items[i].id, .this),
             else => {},

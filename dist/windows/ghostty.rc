@@ -1,6 +1,7 @@
 // LANG_NEUTRAL(0), SUBLANG_NEUTRAL(0)
 LANGUAGE 0, 0
 
+// The build doesn't notice changes to the manifest. Change this file as well.
 #define RT_MANIFEST 1
 RT_MANIFEST 24 "ghostty.manifest"
 

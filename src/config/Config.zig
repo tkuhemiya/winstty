@@ -1457,6 +1457,49 @@ scrollbar: Scrollbar = .system,
 /// This is only supported on Windows.
 @"win32-smooth-scroll": bool = true,
 
+/// Make the window look like glass: a frosted view of what's behind it, with
+/// the tab bar, the gaps between splits and the splits themselves each letting
+/// a different amount of it through.
+///
+/// This replaces `background-opacity` and `background-blur`, which are ignored
+/// while it's on.
+///
+/// Windows can't always show this, such as when its transparency effects are
+/// turned off, in a remote session, or with a high contrast theme. The window
+/// is then opaque, but otherwise looks the same.
+///
+/// This is only supported on Windows 11.
+@"win32-glass": bool = false,
+
+/// How opaque the terminal is with `win32-glass`, from 0.2 to 1. Values outside
+/// of that range are clamped. The gaps between splits are 70 percent as opaque.
+@"win32-glass-opacity": f64 = 0.6,
+
+/// The color of the glass with `win32-glass`. This is either `theme`, for the
+/// background color of the theme, or a color, specified as either hex
+/// (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"win32-glass-tint": GlassTint = .theme,
+
+/// Where tabs are on Windows. Whether they're shown at all is up to
+/// `window-show-tab-bar`.
+///
+/// Valid values:
+///
+///   * `side` *(default)* - A list in a panel on the left.
+///   * `top` - A bar in the title bar.
+@"win32-tab-bar": Win32TabBar = .side,
+
+/// How splits, the side panel and the selection move on Windows.
+///
+/// Valid values:
+///
+///   * `natural` *(default)* - Like a spring, with a slight overshoot.
+///   * `snappy` - Settles quickly, without overshoot.
+///   * `off` - Everything is where it's going to be at once.
+///
+/// This is always off while animation effects are turned off in Windows.
+@"win32-animation": Win32Animation = .natural,
+
 /// Match a regular expression against the terminal text and associate clicking
 /// it with an action. This can be used to match URLs, file paths, etc. Actions
 /// can be opening using the system opener (e.g. `open` or `xdg-open`) or
@@ -2340,7 +2383,8 @@ keybind: Keybinds = .{},
 ///    Never show the tab bar. Tabs are only accessible via the tab
 ///    overview or by keybind actions.
 ///
-/// Currently only supported on Linux (GTK).
+/// Currently only supported on Linux (GTK) and Windows. On Windows this also
+/// applies to the side panel, see `win32-tab-bar`.
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if
@@ -4965,6 +5009,7 @@ pub fn finalize(self: *Config) !void {
     }
 
     self.@"faint-opacity" = std.math.clamp(self.@"faint-opacity", 0.0, 1.0);
+    self.@"win32-glass-opacity" = std.math.clamp(self.@"win32-glass-opacity", 0.2, 1.0);
 
     // Finalize key remapping set for efficient lookups
     self.@"key-remap".finalize();
@@ -5909,6 +5954,82 @@ pub const BoldColor = union(enum) {
         var sc: BoldColor = .bright;
         try sc.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
         try testing.expectEqualSlices(u8, "a = bright\n", buf.written());
+    }
+};
+
+/// See win32-glass-tint
+pub const GlassTint = union(enum) {
+    color: Color,
+    theme,
+
+    pub fn parseCLI(input_: ?[]const u8) !GlassTint {
+        const input = input_ orelse return error.ValueRequired;
+        if (std.mem.eql(u8, input, "theme")) return .theme;
+        return .{ .color = try Color.parseCLI(input) };
+    }
+
+    /// Used by Formatter
+    pub fn formatEntry(self: GlassTint, formatter: formatterpkg.EntryFormatter) !void {
+        switch (self) {
+            .color => try self.color.formatEntry(formatter),
+            .theme => try formatter.formatEntry(
+                [:0]const u8,
+                @tagName(self),
+            ),
+        }
+    }
+
+    test "glass tint: parseCLI" {
+        const testing = std.testing;
+
+        try testing.expectEqual(GlassTint.theme, try GlassTint.parseCLI("theme"));
+        try testing.expectEqual(
+            GlassTint{ .color = .{ .r = 78, .g = 42, .b = 132 } },
+            try GlassTint.parseCLI("#4e2a84"),
+        );
+        try testing.expectEqual(
+            GlassTint{ .color = .{ .r = 0, .g = 0, .b = 0 } },
+            try GlassTint.parseCLI("black"),
+        );
+        try testing.expectError(error.InvalidValue, GlassTint.parseCLI("glassy"));
+        try testing.expectError(error.ValueRequired, GlassTint.parseCLI(null));
+    }
+
+    test "glass tint: formatEntry" {
+        const testing = std.testing;
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+
+        const tint: GlassTint = .theme;
+        try tint.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
+        try testing.expectEqualSlices(u8, "a = theme\n", buf.written());
+    }
+
+    test "glass: opacity is clamped" {
+        const testing = std.testing;
+        for ([_]struct { [:0]const u8, f64 }{
+            .{ "--win32-glass-opacity=0.05", 0.2 },
+            .{ "--win32-glass-opacity=7", 1.0 },
+            .{ "--win32-glass-opacity=0.45", 0.45 },
+        }) |case| {
+            var cfg = try Config.default(testing.allocator);
+            defer cfg.deinit();
+            var it: TestIterator = .{ .data = &.{case[0]} };
+            try cfg.loadIter(testing.allocator, &it);
+            try cfg.finalize();
+            try testing.expectEqual(case[1], cfg.@"win32-glass-opacity");
+        }
+    }
+
+    test "glass: a bad tint is reported, and the default is used" {
+        const testing = std.testing;
+        var cfg = try Config.default(testing.allocator);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--win32-glass-tint=glassy"} };
+        try cfg.loadIter(testing.allocator, &it);
+        try cfg.finalize();
+        try testing.expect(!cfg._diagnostics.empty());
+        try testing.expectEqual(GlassTint.theme, cfg.@"win32-glass-tint");
     }
 };
 
@@ -9544,6 +9665,19 @@ pub const WindowShowTabBar = enum {
     always,
     auto,
     never,
+};
+
+/// See win32-tab-bar
+pub const Win32TabBar = enum {
+    side,
+    top,
+};
+
+/// See win32-animation
+pub const Win32Animation = enum {
+    natural,
+    snappy,
+    off,
 };
 
 /// See drag-handle

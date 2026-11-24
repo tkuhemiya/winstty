@@ -701,7 +701,7 @@ pub fn add(
             .none => {},
             .gtk => try self.addGtk(step),
             .win32 => for ([_][]const u8{
-                "user32", "gdi32", "opengl32", "imm32", "dwmapi", "shell32",
+                "user32", "gdi32", "opengl32", "imm32", "dwmapi", "shell32", "comctl32",
             }) |lib| step.root_module.linkSystemLibrary(lib, .{}),
         }
     }

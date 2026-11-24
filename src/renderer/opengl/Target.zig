@@ -163,7 +163,10 @@ pub fn deinit(self: *Self) void {
 ///
 /// GL_FRAMEBUFFER_SRGB is off for the copy for the same reason as in
 /// `exportDmabuf`: the stored values are already sRGB.
-pub fn blitToScreen(self: *const Self) !void {
+///
+/// Y is up, so `bottom` is what's left of the screen below the frame. It's
+/// negative if the screen is too small for it.
+pub fn blitToScreen(self: *const Self, bottom: i32) !void {
     try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
     defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
         log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
@@ -182,9 +185,9 @@ pub fn blitToScreen(self: *const Self) !void {
         @intCast(self.width),
         @intCast(self.height),
         0,
-        0,
+        bottom,
         @intCast(self.width),
-        @intCast(self.height),
+        bottom + @as(i32, @intCast(self.height)),
         .{ .color_buffer_bit = true },
         .nearest,
     );

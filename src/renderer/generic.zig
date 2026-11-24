@@ -1697,6 +1697,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     else => {},
                 };
 
+                // The apprt may have its own idea of the background.
+                if (self.backgroundOverride()) |v| {
+                    if (v.color) |color| self.uniforms.bg_color[0..3].* = color;
+                    self.uniforms.bg_color[3] = v.opacity;
+                }
+
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies
                 // state that survives frames.
@@ -1823,6 +1829,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .width = surface_size.width,
                 .height = surface_size.height,
             });
+
+            if (@hasDecl(GraphicsAPI, "setClearColor"))
+                self.api.setClearColor(self.uniforms.bg_color);
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2317,6 +2326,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(self.size.screen.width),
                 @floatFromInt(self.size.screen.height),
             };
+        }
+
+        const BackgroundOverride = if (@hasDecl(GraphicsAPI, "Background"))
+            GraphicsAPI.Background
+        else
+            struct { opacity: u8, color: ?[3]u8 };
+
+        fn backgroundOverride(self: *const Self) ?BackgroundOverride {
+            if (comptime !@hasDecl(GraphicsAPI, "background")) return null;
+            return self.api.background();
         }
 
         /// Update the background image vertex buffer (CPU-side).
@@ -3228,7 +3247,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // If the user requested to have opacity on all cells, apply it.
                         if (self.config.background_opacity_cells and bg_style != null) {
                             var opacity: f64 = @floatFromInt(default);
-                            opacity *= self.config.background_opacity;
+                            opacity *= if (self.backgroundOverride()) |v|
+                                @as(f64, @floatFromInt(v.opacity)) / 255
+                            else
+                                self.config.background_opacity;
                             break :bg_alpha @intFromFloat(opacity);
                         }
 

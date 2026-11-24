@@ -15,8 +15,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const input = @import("../../input.zig");
+const Fade = @import("Fade.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
+const glass = @import("glass.zig");
 const paint = @import("paint.zig");
 const themes = @import("themes.zig");
 
@@ -40,6 +42,8 @@ const swatch_size = 10;
 /// Previews wait for the selection to rest, since each reloads the config.
 const preview_timer = 1;
 const preview_ms = 90;
+
+const fade_timer = 2;
 
 /// What the list is of.
 const Mode = enum { commands, themes, shells };
@@ -106,6 +110,8 @@ list_font: ?c.HFONT = null,
 brush: ?c.HGDIOBJ = null,
 colors: paint.Palette = undefined,
 dpi: u32 = 96,
+
+fade: Fade = .{ .timer = fade_timer },
 
 /// True from showing until closing starts.
 open: bool = false,
@@ -249,6 +255,8 @@ fn show(self: *CommandPalette) !void {
     );
     self.relayoutEdit();
 
+    self.fade.fadeIn(hwnd, self.window.animates());
+
     // Showing a popup activates it. That's only wanted if our window has the
     // activation, as otherwise we'd steal it from whatever else has it.
     if (c.GetActiveWindow() == self.window.hwnd) {
@@ -263,8 +271,18 @@ fn updateColors(self: *CommandPalette) void {
     self.colors = .init(&self.window.app.config);
     if (self.brush) |v| _ = c.DeleteObject(v);
     self.brush = c.CreateSolidBrush(self.colors.bar.ref());
+    const look = self.window.look();
+    if (self.hwnd) |v| glass.setPopupBacking(v, look, self.colors);
+    if (self.edit) |v| {
+        glass.setControlBacking(v, look, self.colors.bar);
+        _ = c.InvalidateRect(v, null, 1);
+    }
     self.invalidate();
-    if (self.edit) |v| _ = c.InvalidateRect(v, null, 1);
+}
+
+/// Called when what the window is made of has changed.
+pub fn lookChanged(self: *CommandPalette) void {
+    if (self.open) self.updateColors();
 }
 
 /// Start over with a list of something.
@@ -358,9 +376,12 @@ fn close(self: *CommandPalette) void {
     // the focus would stay with the hidden field.
     const active = self.hwnd != null and c.GetActiveWindow() == self.hwnd;
     self.open = false;
-    self.unload();
     self.endPreview();
-    if (self.hwnd) |v| _ = c.ShowWindow(v, c.SW_HIDE);
+
+    // The list is still there while it fades, unless something in it was run.
+    const fades = self.loaded != null and !self.destroying and self.window.animates();
+    if (self.hwnd) |v| self.fade.fadeOut(v, fades);
+    if (!fades) self.unload();
     if (self.destroying) return;
     if (active) _ = c.SetActiveWindow(self.window.hwnd);
     self.window.focusActive();
@@ -669,9 +690,13 @@ fn placement(self: *const CommandPalette) c.RECT {
     var origin: c.POINT = .{};
     _ = c.ClientToScreen(self.window.hwnd, &origin);
 
+    // Where the terminal is, rather than all of the window.
+    const content = self.window.contentRect();
+    const room = content.right - content.left;
+
     const margin = paint.scale(palette_margin, dpi);
     const top = @min(paint.scale(palette_top, dpi), @divTrunc(client.bottom, 5));
-    const width = @max(1, @min(paint.scale(palette_width, dpi), client.right - 2 * margin));
+    const width = @max(1, @min(paint.scale(palette_width, dpi), room - 2 * margin));
     // Room for the field and a row, even if the window has less.
     const min_height = paint.scale(input_height + footer_height + row_height, dpi);
     const height = @max(min_height, @min(
@@ -679,7 +704,7 @@ fn placement(self: *const CommandPalette) c.RECT {
         client.bottom - top - margin,
     ));
 
-    const left = origin.x + @divTrunc(client.right - width, 2);
+    const left = origin.x + content.left + @divTrunc(room - width, 2);
     return .{
         .left = left,
         .top = origin.y + top,
@@ -909,12 +934,13 @@ fn onPaint(self: *CommandPalette) void {
     defer _ = c.EndPaint(hwnd, &ps);
 
     const l = self.layout();
-    const buf = paint.Buffer.begin(dc, .{ .right = l.width, .bottom = l.height }) orelse return;
+    var buf = paint.Buffer.begin(dc, .{ .right = l.width, .bottom = l.height }) orelse return;
     defer buf.end();
     const colors = self.colors;
     const font = self.list_font;
 
-    buf.fill(.{ .right = l.width, .bottom = l.height }, colors.bar);
+    if (self.window.look() == .frost) buf.base(colors.bar, glass.popup_opacity);
+    buf.surface(.{ .right = l.width, .bottom = l.height }, colors.bar);
 
     // Rows go first, as the ones scrolled partly out of view are covered by
     // the field and footer drawn over them.
@@ -996,9 +1022,9 @@ fn onPaint(self: *CommandPalette) void {
     }
 
     // The field, with the footer showing what the selection does.
-    buf.fill(.{ .right = l.width, .bottom = l.list_top }, colors.bar);
+    buf.surface(.{ .right = l.width, .bottom = l.list_top }, colors.bar);
     buf.fill(.{ .top = l.input_h, .right = l.width, .bottom = l.list_top }, colors.divider);
-    buf.fill(.{ .top = l.list_bottom, .right = l.width, .bottom = l.height }, colors.bar);
+    buf.surface(.{ .top = l.list_bottom, .right = l.width, .bottom = l.height }, colors.bar);
     buf.fill(.{ .top = l.list_bottom, .right = l.width, .bottom = l.list_bottom + 1 }, colors.divider);
     if (self.selected < self.shown.items.len) {
         const item = items[self.shown.items[self.selected]];
@@ -1073,6 +1099,12 @@ fn message(self: *CommandPalette, hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lpar
     const x: c_int = @as(i16, @bitCast(@as(u16, @truncate(bits))));
     const y: c_int = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
 
+    // It's only shown until it has faded.
+    if (!self.open) switch (msg) {
+        c.WM_MOUSEMOVE, c.WM_LBUTTONDOWN, c.WM_LBUTTONUP, c.WM_MOUSEWHEEL, c.WM_COMMAND => return 0,
+        else => {},
+    };
+
     switch (msg) {
         c.WM_DESTROY => {
             // The field goes next, and mustn't call back in to us.
@@ -1088,7 +1120,11 @@ fn message(self: *CommandPalette, hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lpar
         c.WM_ACTIVATE => if (wparam & 0xFFFF == c.WA_INACTIVE) self.close(),
 
         c.WM_PAINT => self.onPaint(),
-        c.WM_TIMER => if (wparam == preview_timer) self.preview(),
+        c.WM_TIMER => switch (wparam) {
+            preview_timer => self.preview(),
+            fade_timer => if (self.fade.onTimer(hwnd) and !self.open) self.unload(),
+            else => return null,
+        },
         c.WM_ERASEBKGND => return 1,
 
         c.WM_SIZE => {
@@ -1153,7 +1189,7 @@ fn editWndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callc
 
     switch (msg) {
         c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
-            if (self.onKey(wparam)) return 0;
+            if (!self.open or self.onKey(wparam)) return 0;
 
             // The message loop only translates keys that belong to an IME,
             // as the surfaces do it themselves. We have no use for that, so

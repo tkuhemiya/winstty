@@ -55,7 +55,13 @@ pub const Palette = struct {
     accent: Rgb,
 
     pub fn init(config: *const Config) Palette {
-        const bg: Rgb = .from(config.background);
+        const bg: Rgb = bg: {
+            if (config.@"win32-glass") switch (config.@"win32-glass-tint") {
+                .theme => {},
+                .color => |v| break :bg .from(v),
+            };
+            break :bg .from(config.background);
+        };
         const fg: Rgb = .from(config.foreground);
         return .{
             .bg = bg,
@@ -119,6 +125,27 @@ pub fn font(family: [*:0]const u16, points: c_int, weight: c_int, dpi: u32) ?c.H
     );
 }
 
+/// Labels are one line and ellipsized, so a long one can be cut short.
+fn toWide(wide: *[512]u16, utf8: []const u8) usize {
+    var end = @min(utf8.len, wide.len);
+    while (end > 0 and end < utf8.len and utf8[end] & 0xC0 == 0x80) end -= 1;
+    return std.unicode.wtf8ToWtf16Le(wide, utf8[0..end]) catch 0;
+}
+
+/// The width of a label that isn't ellipsized.
+pub fn textWidth(dc: c.HDC, utf8: []const u8, with: ?c.HFONT) c_int {
+    var wide: [512]u16 = undefined;
+    const len = toWide(&wide, utf8);
+    if (len == 0) return 0;
+    const old = if (with) |v| c.SelectObject(dc, v) else null;
+    defer if (old) |v| {
+        _ = c.SelectObject(dc, v);
+    };
+    var r: c.RECT = .{};
+    _ = c.DrawTextW(dc, &wide, @intCast(len), &r, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
+    return r.right;
+}
+
 /// A rectangle for antialiased shapes.
 pub const Rect = struct {
     x: f32,
@@ -132,6 +159,16 @@ pub const Rect = struct {
             .y = @floatFromInt(r.top),
             .w = @floatFromInt(r.right - r.left),
             .h = @floatFromInt(r.bottom - r.top),
+        };
+    }
+
+    /// Part of the way to another one.
+    pub fn toward(self: Rect, other: Rect, t: f32) Rect {
+        return .{
+            .x = self.x + (other.x - self.x) * t,
+            .y = self.y + (other.y - self.y) * t,
+            .w = @max(0, self.w + (other.w - self.w) * t),
+            .h = @max(0, self.h + (other.h - self.h) * t),
         };
     }
 
@@ -178,8 +215,9 @@ pub const Buffer = struct {
     opacity: u8 = 255,
 
     /// The pixels have an alpha channel, so they're shown as they are. Set by
-    /// `base`. Only the blending functions may be used, not `fill` or `text`.
+    /// `base`.
     has_alpha: bool = false,
+    base_opacity: u8 = 255,
 
     /// Coordinates drawn to `dc` are relative to the rect's origin.
     pub fn begin(target: c.HDC, rect: c.RECT) ?Buffer {
@@ -239,7 +277,7 @@ pub const Buffer = struct {
     }
 
     /// Free without showing.
-    fn discard(self: Buffer) void {
+    pub fn discard(self: Buffer) void {
         if (self.previous) |v| _ = c.SelectObject(self.dc, v);
         _ = c.DeleteObject(self.bitmap);
         _ = c.DeleteDC(self.dc);
@@ -269,12 +307,33 @@ pub const Buffer = struct {
     /// keeping track of alpha.
     pub fn base(self: *Buffer, color: Rgb, opacity: u8) void {
         self.has_alpha = true;
+        self.base_opacity = opacity;
         const table = premultiplied(opacity);
         const pixel = @as(u32, opacity) << 24 |
             @as(u32, table[color.r]) << 16 |
             @as(u32, table[color.g]) << 8 |
             table[color.b];
         @memset(self.pixels, pixel);
+    }
+
+    /// Replace what's in a rectangle with a color that may be translucent.
+    /// Only for buffers with a base.
+    pub fn replace(self: Buffer, rect: c.RECT, color: Rgb, opacity: u8) void {
+        const table = premultiplied(opacity);
+        const pixel = @as(u32, opacity) << 24 |
+            @as(u32, table[color.r]) << 16 |
+            @as(u32, table[color.g]) << 8 |
+            table[color.b];
+        const width: c_int = @intCast(self.width);
+        const height: c_int = @intCast(self.pixels.len / self.width);
+        const x0: usize = @intCast(std.math.clamp(rect.left, 0, width));
+        const x1: usize = @intCast(std.math.clamp(rect.right, 0, width));
+        if (x0 >= x1) return;
+        var y = std.math.clamp(rect.top, 0, height);
+        while (y < @min(rect.bottom, height)) : (y += 1) {
+            const row = @as(usize, @intCast(y)) * self.width;
+            @memset(self.pixels[row + x0 .. row + x1], pixel);
+        }
     }
 
     fn blend(self: Buffer, index: usize, color: Rgb, alpha: f32) void {
@@ -356,12 +415,44 @@ pub const Buffer = struct {
     pub fn outline(self: Buffer, r: Rect, radius: f32, thickness: f32, color: Rgb) void {
         if (r.w <= 0 or r.h <= 0) return;
         const limited = @min(radius, @min(r.w, r.h) / 2);
+        const margin = limited + thickness + 2;
         const b = self.bounds(r);
         for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
-            const d = distance(r, limited, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
+            const px = @as(f32, @floatFromInt(x)) + 0.5;
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+
+            // Most of it is inside, and nothing is drawn there.
+            if (px > r.x + margin and px < r.x + r.w - margin and
+                py > r.y + margin and py < r.y + r.h - margin) continue;
+            const d = distance(r, limited, px, py);
             const outer = std.math.clamp(0.5 - d, 0, 1);
             const inner = std.math.clamp(0.5 - (d + thickness), 0, 1);
             self.blend(y * self.width + x, color, outer - inner);
+        };
+    }
+
+    /// Light that's caught by the upper edge of a rounded rectangle. It's the
+    /// strongest in the middle.
+    pub fn highlight(self: Buffer, r: Rect, radius: f32, thickness: f32, color: Rgb, alpha: f32) void {
+        if (r.w <= 0 or r.h <= 0) return;
+        const limited = @min(radius, @min(r.w, r.h) / 2);
+        var top = r;
+        top.h = @min(r.h, @max(limited, thickness));
+        const b = self.bounds(top);
+        for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
+            const px = @as(f32, @floatFromInt(x)) + 0.5;
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            const d = distance(r, limited, px, py);
+            const edge = std.math.clamp(0.5 - d, 0, 1) -
+                std.math.clamp(0.5 - (d + thickness), 0, 1);
+            if (edge <= 0) continue;
+            const across = std.math.clamp(@abs(px - (r.x + r.w / 2)) / (r.w / 2), 0, 1);
+            const down = std.math.clamp((py - r.y) / top.h, 0, 1);
+            self.blend(
+                y * self.width + x,
+                color,
+                alpha * edge * (1 - across * across) * (1 - down),
+            );
         };
     }
 
@@ -448,7 +539,14 @@ pub const Buffer = struct {
         }
     }
 
+    /// Fill with a color that's as opaque as the base.
+    pub fn surface(self: Buffer, rect: c.RECT, color: Rgb) void {
+        if (self.has_alpha) return self.replace(rect, color, self.base_opacity);
+        self.fill(rect, color);
+    }
+
     pub fn fill(self: Buffer, rect: c.RECT, color: Rgb) void {
+        if (self.has_alpha) return self.replace(rect, color, 255);
         const brush = c.CreateSolidBrush(color.ref()) orelse return;
         defer _ = c.DeleteObject(brush);
         _ = c.FillRect(self.dc, &rect, brush);
@@ -462,11 +560,11 @@ pub const Buffer = struct {
         color: Rgb,
         flags: u32,
     ) void {
-        // Labels are one line and ellipsized, so a long one can be cut short.
+        // This has no alpha of its own.
+        if (self.has_alpha) return self.blendText(utf8, rect, with, color, 1, flags);
+
         var wide: [512]u16 = undefined;
-        var end_idx = @min(utf8.len, wide.len);
-        while (end_idx > 0 and end_idx < utf8.len and utf8[end_idx] & 0xC0 == 0x80) end_idx -= 1;
-        const len = std.unicode.wtf8ToWtf16Le(&wide, utf8[0..end_idx]) catch return;
+        const len = toWide(&wide, utf8);
         if (len == 0) return;
 
         const old = if (with) |v| c.SelectObject(self.dc, v) else null;

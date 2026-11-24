@@ -15,6 +15,7 @@ const Scrollbar = @import("Scrollbar.zig");
 const SearchBar = @import("SearchBar.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
+const paint = @import("paint.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -43,6 +44,28 @@ inspector: ?*InspectorWindow = null,
 /// Read by the render thread.
 dim: std.atomic.Value(u32) = .init(0),
 
+/// What's used for the background, if it isn't what's configured. This is a
+/// `glass.Background`, read by the render thread.
+background: std.atomic.Value(u64) = .init(0),
+
+/// Where we are, and how the terminal fits that.
+area: c.SIZE = .{},
+fit: Fit = .{},
+
+/// Whether the area moves. Read by the render thread.
+moving: std.atomic.Value(bool) = .init(false),
+
+/// Counts the times the area has moved, and which of them the render thread has
+/// presented. It's told of the first, and sets the second.
+moves: std.atomic.Value(u32) = .init(0),
+presented: std.atomic.Value(u32) = .init(0),
+
+/// The part of the window that's shown, if it's not all of it.
+clip: ?c.SIZE = null,
+
+/// No longer in any tab, and only shown until it's out of the way.
+dying: bool = false,
+
 /// Read by the render thread.
 smooth_scroll: std.atomic.Value(bool) = .init(false),
 
@@ -62,6 +85,28 @@ dead_key: bool = false,
 
 /// High half of a surrogate pair delivered by WM_CHAR.
 high_surrogate: u16 = 0,
+
+/// How a surface fits its area while that moves.
+pub const Fit = struct {
+    moving: bool = false,
+
+    /// The largest the area could be. Drivers take long to resize what's drawn
+    /// to a window, so if it isn't large enough it's made this large, once. It's
+    /// cut off to the area.
+    max_width: c_int = 0,
+    max_height: c_int = 0,
+    target_width: c_int = 0,
+    target_height: c_int = 0,
+
+    /// The size of the terminal follows the area, but only down to this, as
+    /// one that's made very small loses the layout of its contents. What
+    /// doesn't fit is cut off.
+    min_width: c_int = 0,
+    min_height: c_int = 0,
+
+    /// The size of the terminal doesn't follow at all.
+    frozen: bool = false,
+};
 
 /// Create a hidden surface. It's destroyed when no longer in any split tree.
 pub fn create(
@@ -103,6 +148,7 @@ pub fn create(
         .app = app,
         .window = window,
         .hwnd = hwnd,
+        .background = .init(window.background()),
         .cursor = c.LoadCursorW(null, c.IDC_IBEAM),
     };
     self.smooth_scroll.store(app.config.@"win32-smooth-scroll", .release);
@@ -301,6 +347,24 @@ pub fn setWindow(self: *Surface, window: *Window) void {
     self.window = window;
     _ = c.SetParent(self.hwnd, window.hwnd);
     if (self.scrollbar) |v| _ = c.SetParent(v.hwnd, window.hwnd);
+    self.syncBackground();
+}
+
+/// Use the background of the window.
+pub fn syncBackground(self: *Surface) void {
+    const value = self.window.background();
+    if (self.background.swap(value, .acq_rel) == value) return;
+    self.core_surface.refreshCallback() catch |err|
+        log.warn("error refreshing surface err={}", .{err});
+}
+
+/// We're still shown for a moment, but that's all.
+pub fn setDying(self: *Surface) void {
+    if (self.dying) return;
+    self.dying = true;
+    _ = c.EnableWindow(self.hwnd, 0);
+    if (self.scrollbar) |v| _ = c.EnableWindow(v.hwnd, 0);
+    if (self.search) |v| v.hide();
 }
 
 pub fn setVisible(self: *Surface, visible: bool) void {
@@ -318,7 +382,10 @@ pub fn setDimmed(self: *Surface, dimmed: bool) void {
     const value: u32 = value: {
         if (!dimmed) break :value 0;
         const opacity = std.math.clamp(config.@"unfocused-split-opacity", 0, 1);
-        const color = config.@"unfocused-split-fill" orelse config.background;
+        const color: paint.Rgb = if (config.@"unfocused-split-fill") |v|
+            .from(v)
+        else
+            paint.Palette.init(config).bg;
         const alpha: u32 = @intFromFloat(@round((1 - opacity) * 255));
         break :value alpha << 24 | @as(u32, color.r) << 16 | @as(u32, color.g) << 8 | color.b;
     };
@@ -340,19 +407,32 @@ pub fn dpiChanged(self: *Surface) void {
 }
 
 /// Position within the window.
-pub fn place(self: *Surface, area: c.RECT) void {
+pub fn place(self: *Surface, area: c.RECT, fit: Fit) void {
     const flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_NOCOPYBITS;
     const height = @max(1, area.bottom - area.top);
-    const bar = self.scrollbarWidth();
+    const bar = @min(self.scrollbarWidth(), @max(1, area.right - area.left));
+    const width = @max(1, area.right - area.left - bar);
+    self.fit = fit;
+    self.moving.store(fit.moving, .release);
+    self.area = .{ .cx = width, .cy = height };
+
+    var window = self.area;
+    if (fit.moving) {
+        const now = self.windowSize();
+        const grows = fit.target_width - bar > now.cx or fit.target_height > now.cy;
+        window.cx = @max(window.cx, if (grows) @max(now.cx, fit.max_width) else now.cx);
+        window.cy = @max(window.cy, if (grows) @max(now.cy, fit.max_height) else now.cy);
+    }
     _ = c.SetWindowPos(
         self.hwnd,
         null,
         area.left,
         area.top,
-        @max(1, area.right - area.left - bar),
-        height,
+        window.cx,
+        window.cy,
         flags,
     );
+    self.setClip(if (std.meta.eql(window, self.area)) null else self.area);
     if (self.scrollbar) |v| _ = c.SetWindowPos(
         v.hwnd,
         null,
@@ -362,6 +442,55 @@ pub fn place(self: *Surface, area: c.RECT) void {
         height,
         flags,
     );
+
+    // The fit may have changed without the area.
+    self.sizeChanged() catch |err| log.warn("error resizing surface err={}", .{err});
+    if (!fit.moving or !self.ready) return;
+    _ = self.moves.fetchAdd(1, .acq_rel);
+    self.core_surface.refreshCallback() catch |err|
+        log.warn("error refreshing surface err={}", .{err});
+}
+
+fn windowSize(self: *const Surface) c.SIZE {
+    var rect: c.RECT = .{};
+    _ = c.GetClientRect(self.hwnd, &rect);
+    return .{ .cx = rect.right, .cy = rect.bottom };
+}
+
+/// Whether what's shown was drawn since we last moved.
+pub fn isPresented(self: *const Surface) bool {
+    return !self.visible or
+        self.presented.load(.acquire) == self.moves.load(.acquire);
+}
+
+/// Called by the render thread after it presented a frame, with what `moves`
+/// was before.
+pub fn setPresented(self: *Surface, move: u32) void {
+    self.presented.store(move, .release);
+    _ = c.SetEvent(self.app.presented);
+}
+
+fn setClip(self: *Surface, clip: ?c.SIZE) void {
+    if (std.meta.eql(self.clip, clip)) return;
+    self.clip = clip;
+    const region = if (clip) |v| c.CreateRectRgn(0, 0, v.cx, v.cy) else null;
+
+    // It's the system's if this succeeds.
+    if (c.SetWindowRgn(self.hwnd, region, 1) == 0) {
+        if (region) |v| _ = c.DeleteObject(v);
+    }
+}
+
+fn sizeChanged(self: *Surface) !void {
+    if (!self.ready or self.fit.frozen) return;
+    var size: apprt.SurfaceSize = .{
+        .width = @intCast(@max(0, self.area.cx)),
+        .height = @intCast(@max(0, self.area.cy)),
+    };
+    if (size.width == 0 or size.height == 0) return;
+    size.width = @max(size.width, @as(u32, @intCast(@max(0, self.fit.min_width - self.scrollbarWidth()))));
+    size.height = @max(size.height, @as(u32, @intCast(@max(0, self.fit.min_height))));
+    try self.core_surface.sizeCallback(size);
 }
 
 pub fn configChanged(self: *Surface) void {
@@ -459,6 +588,8 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
     const surface = &self.core_surface;
     switch (msg) {
         WM_CLOSE_SURFACE => {
+            if (self.dying) return 0;
+
             // A message box is open, likely above a core callback.
             if (self.app.modal > 0) {
                 self.close_pending = true;
@@ -487,8 +618,7 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
         c.WM_ERASEBKGND => return 1,
 
         c.WM_SIZE => {
-            const size = try self.getSize();
-            if (size.width > 0 and size.height > 0) try surface.sizeCallback(size);
+            try self.sizeChanged();
             if (self.search) |v| v.reposition();
         },
 

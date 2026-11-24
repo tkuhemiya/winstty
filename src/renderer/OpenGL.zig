@@ -65,6 +65,12 @@ dimmer: if (use_wgl) ?wgl.Dimmer else void = if (use_wgl) null else {},
 smooth_scroll: if (use_wgl) ?SmoothScroll else void = if (use_wgl) null else {},
 scroll_geometry: SmoothScroll.Geometry = .{},
 
+/// Whether presenting doesn't wait for the compositor.
+unpaced: bool = false,
+
+/// The background of the frame being drawn.
+clear_color: [4]u8 = @splat(0),
+
 pub fn init(
     alloc: Allocator,
     device: *const Device,
@@ -268,6 +274,49 @@ pub fn setScrollGeometry(self: *OpenGL, geometry: SmoothScroll.Geometry) void {
     self.scroll_geometry = geometry;
 }
 
+/// The opacity, and perhaps the color, to use for the background rather than
+/// what's configured.
+pub fn background(self: *const OpenGL) ?Background {
+    if (comptime !use_wgl) return null;
+    const v: BackgroundOverride = @bitCast(self.rt_surface.background.load(.acquire));
+    if (!v.active) return null;
+    return .{
+        .opacity = v.a,
+        .color = if (v.has_color) .{ v.r, v.g, v.b } else null,
+    };
+}
+
+pub const Background = struct { opacity: u8, color: ?[3]u8 };
+
+const BackgroundOverride = if (use_wgl)
+    @import("../apprt/win32/glass.zig").Background
+else
+    void;
+
+/// Remember the background of the frame that's about to be drawn.
+pub fn setClearColor(self: *OpenGL, color: [4]u8) void {
+    self.clear_color = color;
+}
+
+/// Fill the screen with the background, as the frame is. The values on screen
+/// are sRGB, and were premultiplied before they became that.
+fn clearScreen(self: *const OpenGL) !void {
+    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
+        log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
+    const alpha = @as(f32, @floatFromInt(self.clear_color[3])) / 255;
+    var out: [3]f32 = undefined;
+    for (&out, self.clear_color[0..3]) |*v, value| {
+        const srgb = @as(f32, @floatFromInt(value)) / 255;
+        v.* = wgl.toSrgb(alpha * wgl.toLinear(srgb));
+    }
+    const screen: gl.Framebuffer = .{ .id = 0 };
+    const draw = try screen.bind(.draw);
+    defer draw.unbind();
+    gl.clearColor(out[0], out[1], out[2], alpha);
+    gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+}
+
 /// Whether more frames are needed, for a scroll that's in progress.
 pub fn isScrolling(self: *const OpenGL) bool {
     if (comptime !use_wgl) return false;
@@ -347,17 +396,35 @@ pub fn present(
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
     if (comptime use_wgl) {
-        try target.blitToScreen();
+        const move = self.rt_surface.moves.load(.acquire);
+
+        // The window may not be the size of the frame, if it's moving or has
+        // changed since. What's at the top stays there.
+        const window = self.context.size();
+        const bottom = window.height - @as(i32, @intCast(target.height));
+        if (bottom > 0 or window.width > target.width) try self.clearScreen();
+        try target.blitToScreen(bottom);
         if (self.rt_surface.smooth_scroll.load(.acquire))
-            try SmoothScroll.present(&self.smooth_scroll, &target, self.scroll_geometry)
+            try SmoothScroll.present(&self.smooth_scroll, &target, self.scroll_geometry, bottom)
         else
             SmoothScroll.reset(&self.smooth_scroll);
         const dim = self.rt_surface.dim.load(.acquire);
         if (dim >> 24 > 0) {
             if (self.dimmer == null) self.dimmer = try .init();
-            try self.dimmer.?.draw(dim);
+            try self.dimmer.?.draw(
+                dim,
+                if (self.background()) |v| @as(f32, @floatFromInt(v.opacity)) / 255 else null,
+            );
+        }
+        // Moving a window waits for a swap that's in progress, so don't have
+        // those wait for the compositor. Whatever moves us does already.
+        const moving = self.rt_surface.moving.load(.acquire);
+        if (moving != self.unpaced) {
+            self.unpaced = moving;
+            if (self.device.swap_interval) |f| _ = f(if (moving) 0 else 1);
         }
         try self.context.swap();
+        if (moving) self.rt_surface.setPresented(move);
         return;
     }
 

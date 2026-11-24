@@ -9,8 +9,10 @@ const SearchBar = @This();
 
 const std = @import("std");
 const input = @import("../../input.zig");
+const Fade = @import("Fade.zig");
 const Surface = @import("Surface.zig");
 const c = @import("c.zig");
+const glass = @import("glass.zig");
 const paint = @import("paint.zig");
 
 const log = std.log.scoped(.win32);
@@ -22,6 +24,8 @@ const class = c.L("GhosttySearch");
 const debounce_timer = 1;
 const debounce_ms = 300;
 const debounce_min_len = 3;
+
+const fade_timer = 2;
 
 // Sizes at 96 DPI.
 const bar_width = 340;
@@ -48,6 +52,8 @@ dpi: u32 = 96,
 /// For WM_CTLCOLOREDIT, which needs a brush that outlives the message.
 brush: ?c.HGDIOBJ = null,
 brush_color: c.COLORREF = 0,
+
+fade: Fade = .{ .timer = fade_timer },
 
 /// Whether a search is in progress as far as the user is concerned. The popup
 /// is only visible if this is set, but may be hidden even if it is, when the
@@ -149,6 +155,7 @@ pub fn show(self: *SearchBar, needle: [:0]const u8) void {
     const edit = self.edit orelse return;
     const was_open = self.open;
     self.open = true;
+    self.lookChanged();
     self.reposition();
 
     if (needle.len > 0) {
@@ -186,7 +193,7 @@ pub fn hide(self: *SearchBar) void {
 
     const focus = c.GetFocus();
     const had_focus = focus != null and (focus == hwnd or focus == self.edit);
-    if (c.IsWindowVisible(hwnd) != 0) _ = c.ShowWindow(hwnd, c.SW_HIDE);
+    self.fade.fadeOut(hwnd, self.surface.window.animates() and !self.surface.dying);
 
     // Whoever had the focus is hidden now, so give it back. Not to the
     // window's active surface, which may be a different split.
@@ -194,6 +201,18 @@ pub fn hide(self: *SearchBar) void {
         _ = c.SetActiveWindow(self.surface.window.hwnd);
         if (self.surface.visible) _ = c.SetFocus(self.surface.hwnd);
     }
+}
+
+/// Called when what the window is made of, or its colors, have changed.
+pub fn lookChanged(self: *SearchBar) void {
+    const look = self.surface.window.look();
+    const palette: paint.Palette = .init(&self.surface.app.config);
+    if (self.hwnd) |v| glass.setPopupBacking(v, look, palette);
+    if (self.edit) |v| {
+        glass.setControlBacking(v, look, palette.bar);
+        _ = c.InvalidateRect(v, null, 1);
+    }
+    self.invalidate();
 }
 
 pub fn setTotal(self: *SearchBar, total: ?usize) void {
@@ -233,8 +252,12 @@ pub fn reposition(self: *SearchBar) void {
         c.IsIconic(window.hwnd) != 0 or
         c.IsWindowVisible(surface.hwnd) == 0)
     {
-        if (c.IsWindowVisible(hwnd) != 0) _ = c.ShowWindow(hwnd, c.SW_HIDE);
+        // Unless it's on its way out.
+        if (c.IsWindowVisible(hwnd) != 0 and !self.fade.leaving()) self.fade.fadeOut(hwnd, false);
         return;
+    }
+    if (c.IsWindowVisible(hwnd) == 0 or self.fade.leaving()) {
+        self.fade.fadeIn(hwnd, window.animates());
     }
 
     var origin: c.POINT = .{ .x = client.right - margin - width, .y = margin };
@@ -364,11 +387,12 @@ fn onPaint(self: *SearchBar, hwnd: c.HWND) void {
 
     const size = clientSize(hwnd);
     const full: c.RECT = .{ .right = size.x, .bottom = size.y };
-    const buf = paint.Buffer.begin(dc, full) orelse return;
+    var buf = paint.Buffer.begin(dc, full) orelse return;
     defer buf.end();
 
     const palette: paint.Palette = .init(&self.surface.app.config);
-    buf.fill(full, palette.bar);
+    if (self.surface.window.look() == .frost) buf.base(palette.bar, glass.popup_opacity);
+    buf.surface(full, palette.bar);
 
     // The border.
     buf.fill(.{ .right = size.x, .bottom = 1 }, palette.divider);
@@ -514,6 +538,10 @@ fn message(self: *SearchBar, hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c
         },
 
         c.WM_TIMER => {
+            if (wparam == fade_timer) {
+                _ = self.fade.onTimer(hwnd);
+                return 0;
+            }
             if (wparam != debounce_timer) return null;
             self.stopTimer();
             self.search();

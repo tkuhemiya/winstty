@@ -149,7 +149,14 @@ fn ringHeight(geometry: Geometry) usize {
 
 /// Called with a frame that has been copied to the screen. Shows it sliding
 /// over that if it has to. Creates and destroys what it needs in the slot.
-pub fn present(slot: *?SmoothScroll, target: *const Target, geometry: Geometry) !void {
+///
+/// The frame is `bottom` above the bottom of the screen, see `blitToScreen`.
+pub fn present(
+    slot: *?SmoothScroll,
+    target: *const Target,
+    geometry: Geometry,
+    bottom: i32,
+) !void {
     // The grid may not fit for a moment while resizing.
     if (geometry.width != target.width or
         geometry.height != target.height or
@@ -186,7 +193,7 @@ pub fn present(slot: *?SmoothScroll, target: *const Target, geometry: Geometry) 
     defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
         log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
     try self.remember(target);
-    if (self.position.animating) try self.show();
+    if (self.position.animating) try self.show(bottom);
 }
 
 pub fn reset(slot: *?SmoothScroll) void {
@@ -207,14 +214,14 @@ fn remember(self: *const SmoothScroll, target: *const Target) !void {
         try blit(
             g.width,
             g.height - g.padding_top - s.offset,
-            ring - s.start,
+            @intCast(ring - s.start),
             s.len,
         );
     }
 }
 
 /// Copy rows from the ring to the screen.
-fn show(self: *const SmoothScroll) !void {
+fn show(self: *const SmoothScroll, bottom: i32) !void {
     const read = try self.framebuffer.bind(.read);
     defer read.unbind();
     const screen: gl.Framebuffer = .{ .id = 0 };
@@ -229,14 +236,14 @@ fn show(self: *const SmoothScroll) !void {
         try blit(
             g.width,
             ring - s.start,
-            g.height - g.padding_top - s.offset,
+            @as(i32, @intCast(g.height - g.padding_top - s.offset)) + bottom,
             s.len,
         );
     }
 }
 
 /// Copy a full width part, given its upper edges. Y is up in OpenGL.
-fn blit(width: usize, src_top: usize, dst_top: usize, height: usize) !void {
+fn blit(width: usize, src_top: usize, dst_top: i32, height: usize) !void {
     if (height == 0) return;
     try gl.blitFramebuffer(
         0,
@@ -244,9 +251,9 @@ fn blit(width: usize, src_top: usize, dst_top: usize, height: usize) !void {
         @intCast(width),
         @intCast(src_top),
         0,
-        @intCast(dst_top - height),
+        dst_top - @as(i32, @intCast(height)),
         @intCast(width),
-        @intCast(dst_top),
+        dst_top,
         .{ .color_buffer_bit = true },
         .nearest,
     );

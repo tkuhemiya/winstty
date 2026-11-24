@@ -11,5 +11,8 @@ test {
     _ = App;
     _ = Surface;
     _ = @import("win32/CommandPalette.zig");
+    _ = @import("win32/glass.zig");
+    _ = @import("win32/layout.zig");
+    _ = @import("win32/motion.zig");
     _ = @import("win32/themes.zig");
 }

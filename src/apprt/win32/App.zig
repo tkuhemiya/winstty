@@ -8,12 +8,16 @@ const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const InspectorWindow = @import("InspectorWindow.zig");
+const Outline = @import("Outline.zig");
 const Scrollbar = @import("Scrollbar.zig");
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const Surface = @import("Surface.zig");
+const Ticker = @import("Ticker.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
+const glass = @import("glass.zig");
+const motion = @import("motion.zig");
 const themes = @import("themes.zig");
 
 const log = std.log.scoped(.win32);
@@ -26,6 +30,8 @@ const app_class = c.L("GhosttyApp");
 const WM_WAKEUP = c.WM_APP + 1;
 /// Posted to the message-only window to close every window and exit.
 const WM_QUIT_APP = c.WM_APP + 2;
+/// Posted to the message-only window for each frame of animation.
+const WM_TICK = c.WM_APP + 3;
 
 core_app: *CoreApp,
 config: Config,
@@ -46,6 +52,20 @@ last_tab_id: u32 = 0,
 /// The number of open message boxes. They pump messages, and may have been
 /// opened from inside a core callback, so nothing may be destroyed meanwhile.
 modal: u32 = 0,
+
+/// For windows with something that moves.
+ticker: Ticker,
+
+/// Signaled when a surface that's moving has been drawn.
+presented: c.HANDLE,
+
+/// Why glass can't be shown, if it can't.
+blur_unavailable: ?[]const u8 = null,
+high_contrast: bool = false,
+/// Whether Windows is set to show animations.
+animations: bool = true,
+/// The note about settings that glass replaces has been made.
+noted_glass: bool = false,
 
 /// Set once we've started exiting, so teardown doesn't re-enter.
 quitting: bool = false,
@@ -87,6 +107,8 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
     try SearchBar.register(hinstance);
     try CommandPalette.register(hinstance);
     try InspectorWindow.register(hinstance);
+    try Outline.register(hinstance);
+    _ = c.InitCommonControlsEx(&.{ .dwICC = c.ICC_BAR_CLASSES });
     if (c.RegisterClassExW(&.{
         .lpfnWndProc = wndProc,
         .hInstance = hinstance,
@@ -113,8 +135,12 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
         .config = config,
         .hinstance = hinstance,
         .hwnd = hwnd,
+        .ticker = try .init(hwnd, WM_TICK),
+        .presented = c.CreateEventW(null, 0, 0, null) orelse return error.Win32Failed,
     };
     _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    self.readSystem();
+    self.logGlass();
     core_app.colorSchemeEvent(self, systemColorScheme()) catch |err|
         log.warn("error setting color scheme err={}", .{err});
 }
@@ -145,6 +171,8 @@ pub fn run(self: *App) !void {
 pub fn terminate(self: *App) void {
     self.closeAll();
     if (self.shell_override) |v| self.core_app.alloc.free(v);
+    self.ticker.deinit();
+    _ = c.CloseHandle(self.presented);
     _ = c.DestroyWindow(self.hwnd);
     self.windows.deinit(self.core_app.alloc);
     self.config.deinit();
@@ -170,6 +198,8 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
         WM_WAKEUP => self.core_app.tick(self) catch |err|
             log.err("error in app tick err={}", .{err}),
 
+        WM_TICK => self.tick(),
+
         WM_QUIT_APP => if (!self.quitting and self.modal == 0) {
             if (self.core_app.needsConfirmQuit() and !self.confirm(
                 null,
@@ -183,6 +213,62 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
         else => return c.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     return 0;
+}
+
+/// A frame of animation.
+fn tick(self: *App) void {
+    self.ticker.handled();
+    var more = false;
+    for (self.windows.items) |window| {
+        if (window.frame()) more = true;
+    }
+    if (!more) self.ticker.stop();
+}
+
+/// How things move at the moment.
+pub fn motionStyle(self: *const App) motion.Style {
+    return if (self.animations) self.config.@"win32-animation" else .off;
+}
+
+/// How windows look, unless they've been made to look otherwise.
+pub fn look(self: *const App) glass.Look {
+    if (!self.config.@"win32-glass") return .off;
+    return if (self.blur_unavailable == null) .frost else .solid;
+}
+
+fn readSystem(self: *App) void {
+    self.blur_unavailable = glass.unavailable();
+    self.high_contrast = glass.highContrast();
+    var animations: c.BOOL = 1;
+    _ = c.SystemParametersInfoW(c.SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+    self.animations = animations != 0;
+}
+
+/// Called when a setting of Windows may have changed. Every window is told of
+/// that, so usually nothing has.
+pub fn systemChanged(self: *App) void {
+    const before = .{ self.look(), self.high_contrast };
+    self.readSystem();
+    if (self.look() == before[0] and self.high_contrast == before[1]) return;
+    if (self.look() != before[0]) self.logGlass();
+    for (self.windows.items) |window| window.lookChanged();
+}
+
+fn logGlass(self: *App) void {
+    const config = &self.config;
+    if (!config.@"win32-glass") return;
+    if (self.blur_unavailable) |why| log.info("glass is solid because {s}", .{why});
+
+    if (self.noted_glass) return;
+    const blur = switch (config.@"background-blur") {
+        .false => false,
+        .radius => |v| v > 0,
+        else => true,
+    };
+    if (config.@"background-opacity" < 1 or blur) {
+        self.noted_glass = true;
+        log.info("background-opacity and background-blur are ignored because of win32-glass", .{});
+    }
 }
 
 fn closeAll(self: *App) void {
@@ -382,6 +468,7 @@ fn reloadConfig(self: *App, soft: bool) !void {
         const config = try Config.load(self.core_app.alloc);
         self.config.deinit();
         self.config = config;
+        self.logGlass();
     }
     try self.applyConfig();
 }

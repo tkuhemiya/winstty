@@ -60,6 +60,8 @@ const pixel_format: PIXELFORMATDESCRIPTOR = .{
 
 extern "user32" fn GetDC(?HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(?HWND, HDC) callconv(.winapi) c_int;
+const RECT = extern struct { left: c_int = 0, top: c_int = 0, right: c_int = 0, bottom: c_int = 0 };
+extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
 extern "user32" fn DestroyWindow(HWND) callconv(.winapi) BOOL;
 extern "user32" fn CreateWindowExW(
     u32,
@@ -192,6 +194,13 @@ pub const Context = struct {
         _ = ReleaseDC(self.hwnd, self.dc);
     }
 
+    /// The size of the window, which the size of what's drawn follows.
+    pub fn size(self: Context) struct { width: i32, height: i32 } {
+        var rect: RECT = .{};
+        _ = GetClientRect(self.hwnd, &rect);
+        return .{ .width = rect.right, .height = rect.bottom };
+    }
+
     pub fn makeCurrent(self: Context) !void {
         if (wglMakeCurrent(self.dc, self.rc) == 0) return error.WglMakeCurrentFailed;
     }
@@ -204,6 +213,16 @@ pub const Context = struct {
         if (SwapBuffers(self.dc) == 0) return error.WglSwapFailed;
     }
 };
+
+pub fn toLinear(v: f32) f32 {
+    if (v <= 0.04045) return v / 12.92;
+    return std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+pub fn toSrgb(v: f32) f32 {
+    if (v <= 0.0031308) return v * 12.92;
+    return 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
 
 /// Draws a translucent color over the whole window.
 pub const Dimmer = struct {
@@ -240,7 +259,12 @@ pub const Dimmer = struct {
 
     /// The color is 0xAARRGGBB. The values on screen are sRGB, so this blends
     /// in sRGB as desktops do.
-    pub fn draw(self: Dimmer, argb: u32) !void {
+    ///
+    /// With the opacity of the background, the color is made as translucent as
+    /// the renderer makes that, so that dimming a background with its own color
+    /// doesn't change it. Otherwise the two differ, more so the more translucent
+    /// the background is.
+    pub fn draw(self: Dimmer, argb: u32, opacity: ?f32) !void {
         try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
         defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
             log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
@@ -262,11 +286,21 @@ pub const Dimmer = struct {
         // Premultiplied.
         const a = @as(f32, @floatFromInt(argb >> 24)) / 255;
         const f = struct {
-            fn f(v: u32, alpha: f32) f32 {
-                return @as(f32, @floatFromInt(v & 0xFF)) / 255 * alpha;
+            fn f(v: u32, alpha: f32, background: ?f32) f32 {
+                const color = @as(f32, @floatFromInt(v & 0xFF)) / 255;
+                const o = background orelse return color * alpha;
+                if (o <= 0) return color * alpha;
+                // It's multiplied by the opacity when it's blended.
+                return alpha * toSrgb(toLinear(color) * o) / o;
             }
         }.f;
-        gl.glad.context.Uniform4f.?(self.color, f(argb >> 16, a), f(argb >> 8, a), f(argb, a), a);
+        gl.glad.context.Uniform4f.?(
+            self.color,
+            f(argb >> 16, a, opacity),
+            f(argb >> 8, a, opacity),
+            f(argb, a, opacity),
+            a,
+        );
         try gl.drawArrays(gl.c.GL_TRIANGLES, 0, 3);
     }
 };

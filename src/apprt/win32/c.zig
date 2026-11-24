@@ -474,3 +474,105 @@ pub const SW_MINIMIZE = 6;
 pub const GW_OWNER = 4;
 pub const DWMWA_BORDER_COLOR = 34;
 pub extern "user32" fn GetWindow(HWND, u32) callconv(.winapi) ?HWND;
+
+//---------------------------------------------------------------
+// Glass
+
+pub const ACCENT_ENABLE_ACRYLICBLURBEHIND = 4;
+pub const WM_SYSCOLORCHANGE = 0x0015;
+pub const WM_DISPLAYCHANGE = 0x007E;
+pub const WM_POWERBROADCAST = 0x0218;
+pub const WM_THEMECHANGED = 0x031A;
+pub const SM_REMOTESESSION = 0x1000;
+pub const SPI_GETHIGHCONTRAST = 0x0042;
+pub const HCF_HIGHCONTRASTON = 1;
+pub const GWL_EXSTYLE = -20;
+pub const WS_EX_LAYERED: u32 = 0x80000;
+pub const WS_EX_TRANSPARENT: u32 = 0x20;
+pub const WS_EX_NOACTIVATE: u32 = 0x08000000;
+pub const LWA_COLORKEY = 1;
+pub const LWA_ALPHA = 2;
+
+pub const HIGHCONTRASTW = extern struct {
+    cbSize: u32 = @sizeOf(HIGHCONTRASTW),
+    dwFlags: u32 = 0,
+    lpszDefaultScheme: ?[*:0]u16 = null,
+};
+pub const SYSTEM_POWER_STATUS = extern struct {
+    ACLineStatus: u8 = 0,
+    BatteryFlag: u8 = 0,
+    BatteryLifePercent: u8 = 0,
+    /// Whether battery saver is on.
+    SystemStatusFlag: u8 = 0,
+    BatteryLifeTime: u32 = 0,
+    BatteryFullLifeTime: u32 = 0,
+};
+pub const GUID = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
+pub const GUID_POWER_SAVING_STATUS: GUID = .{
+    .a = 0xE00958C0,
+    .b = 0xC213,
+    .c = 0x4ACE,
+    .d = .{ 0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5 },
+};
+
+pub extern "kernel32" fn GetSystemPowerStatus(*SYSTEM_POWER_STATUS) callconv(.winapi) BOOL;
+pub extern "user32" fn GetSystemMetrics(c_int) callconv(.winapi) c_int;
+pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
+pub extern "user32" fn RegisterPowerSettingNotification(HWND, *const GUID, u32) callconv(.winapi) ?HANDLE;
+pub extern "user32" fn UnregisterPowerSettingNotification(HANDLE) callconv(.winapi) BOOL;
+pub extern "user32" fn SetLayeredWindowAttributes(HWND, COLORREF, u8, u32) callconv(.winapi) BOOL;
+
+//---------------------------------------------------------------
+// Motion
+
+pub const SPI_GETCLIENTAREAANIMATION = 0x1042;
+pub const SIZE = extern struct { cx: c_int = 0, cy: c_int = 0 };
+pub const BLENDFUNCTION = extern struct {
+    BlendOp: u8 = 0,
+    BlendFlags: u8 = 0,
+    SourceConstantAlpha: u8 = 255,
+    AlphaFormat: u8 = 1,
+};
+pub const ULW_ALPHA = 2;
+
+pub extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn QueryPerformanceFrequency(*i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreateEventW(?*anyopaque, BOOL, BOOL, ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn SetEvent(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn ResetEvent(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn WaitForSingleObject(HANDLE, u32) callconv(.winapi) u32;
+pub extern "dwmapi" fn DwmFlush() callconv(.winapi) c_long;
+pub extern "user32" fn SetWindowRgn(HWND, ?HGDIOBJ, BOOL) callconv(.winapi) c_int;
+pub extern "user32" fn UpdateWindow(HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn EnableWindow(HWND, BOOL) callconv(.winapi) BOOL;
+pub extern "user32" fn UpdateLayeredWindow(HWND, ?HDC, ?*const POINT, ?*const SIZE, ?HDC, ?*const POINT, COLORREF, ?*const BLENDFUNCTION, u32) callconv(.winapi) BOOL;
+
+//---------------------------------------------------------------
+// Side panel
+
+pub const ICC_BAR_CLASSES = 0x4;
+pub const TTS_ALWAYSTIP: u32 = 0x1;
+pub const TTS_NOPREFIX: u32 = 0x2;
+pub const TTF_SUBCLASS = 0x10;
+pub const TTM_POP = 0x041C;
+pub const TTM_ADDTOOLW = 0x0432;
+pub const TTM_NEWTOOLRECTW = 0x0434;
+pub const TTM_UPDATETIPTEXTW = 0x0439;
+
+pub const INITCOMMONCONTROLSEX = extern struct {
+    dwSize: u32 = @sizeOf(INITCOMMONCONTROLSEX),
+    dwICC: u32,
+};
+pub const TOOLINFOW = extern struct {
+    cbSize: u32 = @sizeOf(TOOLINFOW),
+    uFlags: u32 = 0,
+    hwnd: ?HWND = null,
+    uId: usize = 0,
+    rect: RECT = .{},
+    hinst: ?HINSTANCE = null,
+    lpszText: ?[*:0]const u16 = null,
+    lParam: LPARAM = 0,
+    lpReserved: ?*anyopaque = null,
+};
+pub extern "comctl32" fn InitCommonControlsEx(*const INITCOMMONCONTROLSEX) callconv(.winapi) BOOL;
