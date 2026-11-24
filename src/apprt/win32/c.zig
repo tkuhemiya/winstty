@@ -446,3 +446,25 @@ pub const GL_COLOR_BUFFER_BIT = 0x4000;
 pub extern "opengl32" fn glViewport(c_int, c_int, c_int, c_int) callconv(.winapi) void;
 pub extern "opengl32" fn glClearColor(f32, f32, f32, f32) callconv(.winapi) void;
 pub extern "opengl32" fn glClear(u32) callconv(.winapi) void;
+
+//---------------------------------------------------------------
+// Custom frame
+
+pub const HTTRANSPARENT = -1;
+pub const HTCAPTION = 2;
+pub const HTMINBUTTON = 8;
+pub const HTMAXBUTTON = 9;
+pub const HTTOP = 12;
+pub const HTCLOSE = 20;
+pub const WM_NCCALCSIZE = 0x0083;
+pub const WM_NCHITTEST = 0x0084;
+pub const WM_NCMOUSEMOVE = 0x00A0;
+pub const WM_NCLBUTTONDOWN = 0x00A1;
+pub const WM_NCLBUTTONUP = 0x00A2;
+pub const WM_NCLBUTTONDBLCLK = 0x00A3;
+pub const WM_NCMOUSELEAVE = 0x02A2;
+pub const TME_NONCLIENT = 0x10;
+pub const SW_MINIMIZE = 6;
+pub const GW_OWNER = 4;
+pub const DWMWA_BORDER_COLOR = 34;
+pub extern "user32" fn GetWindow(HWND, u32) callconv(.winapi) ?HWND;

@@ -317,7 +317,7 @@ fn updateFonts(self: *CommandPalette) void {
     self.dpi = self.window.getDpi();
     if (self.edit_font) |v| _ = c.DeleteObject(v);
     if (self.list_font) |v| _ = c.DeleteObject(v);
-    self.edit_font = paint.uiFont(12, self.dpi);
+    self.edit_font = paint.uiFont(13, self.dpi);
     self.list_font = paint.uiFont(10, self.dpi);
     if (self.edit) |v| {
         _ = c.SendMessageW(v, c.WM_SETFONT, if (self.edit_font) |f| @intFromPtr(f) else 0, 1);
@@ -635,9 +635,9 @@ fn onPaint(self: *CommandPalette) void {
         const top = l.list_top - self.scroll + @as(c_int, @intCast(index * row_h));
         const row: c.RECT = .{ .left = inset, .top = top, .right = l.width - gutter, .bottom = top + l.row_h };
         if (index == self.selected) {
-            buf.fill(row, colors.selected);
+            buf.glass(.from(row), @floatFromInt(paint.scale(9, self.dpi)), colors.fg, 0.14);
         } else if (self.hover == index) {
-            buf.fill(row, colors.hover);
+            buf.round(.from(row), @floatFromInt(paint.scale(9, self.dpi)), colors.fg, 0.05);
         }
 
         var title_right = right_edge;
@@ -676,12 +676,12 @@ fn onPaint(self: *CommandPalette) void {
         const thumb = @max(paint.scale(24, self.dpi), @divTrunc(view * view, content));
         const top = l.list_top + @divTrunc((view - thumb) * self.scroll, max);
         const width = paint.scale(scrollbar_width, self.dpi);
-        buf.fill(.{
+        buf.round(.from(.{
             .left = l.width - width - paint.scale(4, self.dpi),
             .top = top,
             .right = l.width - paint.scale(4, self.dpi),
             .bottom = top + thumb,
-        }, colors.dim);
+        }), @floatFromInt(width), colors.fg, 0.35);
     }
 
     // The field, with the footer showing what the selection does.

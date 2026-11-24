@@ -4,6 +4,7 @@
 //! apprt to composite, WGL contexts are bound to a window's device context
 //! and the render thread presents directly with SwapBuffers.
 const std = @import("std");
+const gl = @import("opengl");
 
 const log = std.log.scoped(.opengl);
 
@@ -201,5 +202,64 @@ pub const Context = struct {
 
     pub fn swap(self: Context) !void {
         if (SwapBuffers(self.dc) == 0) return error.WglSwapFailed;
+    }
+};
+
+/// Draws a translucent color over the whole window.
+pub const Dimmer = struct {
+    program: gl.Program,
+    vao: gl.VertexArray,
+    color: gl.c.GLint,
+
+    pub fn init() !Dimmer {
+        // A triangle that covers the screen.
+        const program = try gl.Program.createVF(
+            \\#version 430 core
+            \\void main() {
+            \\    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+            \\    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+            \\}
+        ,
+            \\#version 430 core
+            \\uniform vec4 color;
+            \\out vec4 result;
+            \\void main() { result = color; }
+        );
+        errdefer program.destroy();
+        return .{
+            .program = program,
+            .vao = try gl.VertexArray.create(),
+            .color = gl.glad.context.GetUniformLocation.?(program.id, "color"),
+        };
+    }
+
+    pub fn deinit(self: Dimmer) void {
+        self.program.destroy();
+        self.vao.destroy();
+    }
+
+    /// The color is 0xAARRGGBB. The values on screen are sRGB, so this blends
+    /// in sRGB as desktops do.
+    pub fn draw(self: Dimmer, argb: u32) !void {
+        try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+        defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
+            log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
+        try gl.enable(gl.c.GL_BLEND);
+        try gl.blendFunc(gl.c.GL_ONE, gl.c.GL_ONE_MINUS_SRC_ALPHA);
+
+        const program = try self.program.use();
+        defer program.unbind();
+        const vao = try self.vao.bind();
+        defer vao.unbind();
+
+        // Premultiplied.
+        const a = @as(f32, @floatFromInt(argb >> 24)) / 255;
+        const f = struct {
+            fn f(v: u32, alpha: f32) f32 {
+                return @as(f32, @floatFromInt(v & 0xFF)) / 255 * alpha;
+            }
+        }.f;
+        gl.glad.context.Uniform4f.?(self.color, f(argb >> 16, a), f(argb >> 8, a), f(argb, a), a);
+        try gl.drawArrays(gl.c.GL_TRIANGLES, 0, 3);
     }
 };

@@ -20,6 +20,13 @@ const bar_width = 12;
 const thumb_min = 28;
 const thumb_margin = 3;
 
+const fade_timer = 1;
+const fade_ms = 15;
+
+/// How long the thumb stays after scrolling.
+const linger_timer = 2;
+const linger_ms = 1200;
+
 surface: *Surface,
 hwnd: c.HWND,
 state: terminal.Scrollbar = .zero,
@@ -27,6 +34,11 @@ hover: bool = false,
 
 /// Distance from the top of the thumb to the pointer, while dragging it.
 drag: ?c_int = null,
+
+/// The thumb is only visible while it's of use.
+alpha: f32 = 0,
+lingering: bool = false,
+fading: bool = false,
 
 pub fn register(hinstance: c.HINSTANCE) !void {
     if (c.RegisterClassExW(&.{
@@ -72,7 +84,52 @@ pub fn width(dpi: u32) c_int {
 pub fn set(self: *Scrollbar, state: terminal.Scrollbar) void {
     if (std.meta.eql(self.state, state)) return;
     self.state = state;
+    self.linger();
     self.invalidate();
+}
+
+/// Show the thumb for a while.
+fn linger(self: *Scrollbar) void {
+    if (self.maxOffset() == 0) return;
+
+    // This restarts the timer if it's running.
+    self.lingering = c.SetTimer(self.hwnd, linger_timer, linger_ms, null) != 0;
+    self.fade();
+}
+
+fn targetAlpha(self: *const Scrollbar) f32 {
+    if (self.drag != null) return 0.55;
+    if (self.hover) return 0.42;
+    return if (self.lingering) 0.28 else 0;
+}
+
+/// Start moving towards the target alpha.
+fn fade(self: *Scrollbar) void {
+    if (self.fading or self.alpha == self.targetAlpha()) return;
+    self.fading = c.SetTimer(self.hwnd, fade_timer, fade_ms, null) != 0;
+}
+
+fn onTimer(self: *Scrollbar, id: usize) void {
+    switch (id) {
+        linger_timer => {
+            _ = c.KillTimer(self.hwnd, linger_timer);
+            self.lingering = false;
+            self.fade();
+        },
+        fade_timer => {
+            const target = self.targetAlpha();
+            const remaining = target - self.alpha;
+            if (@abs(remaining) < 0.02) {
+                self.alpha = target;
+                self.fading = false;
+                _ = c.KillTimer(self.hwnd, fade_timer);
+            } else {
+                self.alpha += remaining * 0.25;
+            }
+            self.invalidate();
+        },
+        else => {},
+    }
 }
 
 pub fn invalidate(self: *Scrollbar) void {
@@ -114,20 +171,19 @@ fn onPaint(self: *Scrollbar) void {
     var rect: c.RECT = .{};
     _ = c.GetClientRect(self.hwnd, &rect);
     var buf = paint.Buffer.begin(dc, rect) orelse return;
-    buf.opacity = self.surface.window.backgroundOpacity();
     defer buf.end();
 
     const palette: paint.Palette = .init(&self.surface.app.config);
-    buf.fill(rect, palette.bg);
+    buf.base(palette.bg, self.surface.window.backgroundOpacity());
     const t = self.thumb() orelse return;
     const margin = paint.scale(thumb_margin, c.GetDpiForWindow(self.hwnd));
-    const strength: u8 = if (self.drag != null) 130 else if (self.hover) 100 else 60;
-    buf.fill(.{
+    const r: paint.Rect = .from(.{
         .left = margin,
-        .top = t.top + @min(margin, @divTrunc(t.height, 4)),
+        .top = t.top + margin,
         .right = rect.right - margin,
-        .bottom = t.top + t.height - @min(margin, @divTrunc(t.height, 4)),
-    }, palette.bg.mix(palette.fg, strength));
+        .bottom = t.top + t.height - margin,
+    });
+    buf.round(r, r.w / 2, palette.fg, self.alpha);
 }
 
 fn scrollTo(self: *Scrollbar, row: usize) !void {
@@ -164,6 +220,8 @@ fn message(self: *Scrollbar, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.L
     switch (msg) {
         c.WM_PAINT => self.onPaint(),
         c.WM_ERASEBKGND => return 1,
+        c.WM_TIMER => self.onTimer(wparam),
+        c.WM_NCHITTEST => return if (self.surface.window.inResizeBand(y)) c.HTTRANSPARENT else null,
         c.WM_SIZE => self.invalidate(),
         c.WM_SETCURSOR => {
             _ = c.SetCursor(c.LoadCursorW(null, c.IDC_ARROW));
@@ -174,13 +232,14 @@ fn message(self: *Scrollbar, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.L
             if (!self.hover) {
                 var track: c.TRACKMOUSEEVENT = .{ .dwFlags = c.TME_LEAVE, .hwndTrack = self.hwnd };
                 self.hover = c.TrackMouseEvent(&track) != 0;
-                self.invalidate();
+                self.fade();
             }
             if (self.drag) |grab| try self.onDrag(grab, y);
         },
         c.WM_MOUSELEAVE => {
             self.hover = false;
-            self.invalidate();
+            self.linger();
+            self.fade();
         },
 
         c.WM_LBUTTONDOWN => if (self.thumb()) |t| {
@@ -191,7 +250,7 @@ fn message(self: *Scrollbar, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.L
             } else {
                 self.drag = y - t.top;
                 _ = c.SetCapture(self.hwnd);
-                self.invalidate();
+                self.fade();
             }
         },
         c.WM_LBUTTONUP => if (self.drag != null) {
@@ -199,7 +258,7 @@ fn message(self: *Scrollbar, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.L
         },
         c.WM_CAPTURECHANGED => {
             self.drag = null;
-            self.invalidate();
+            self.fade();
         },
 
         c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL => return c.SendMessageW(

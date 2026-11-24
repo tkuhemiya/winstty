@@ -99,7 +99,7 @@ pub fn create(surface: *Surface) !*SearchBar {
     self.hwnd = hwnd;
     _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    var corners: u32 = c.DWMWCP_ROUNDSMALL;
+    var corners: u32 = c.DWMWCP_ROUND;
     _ = c.DwmSetWindowAttribute(hwnd, c.DWMWA_WINDOW_CORNER_PREFERENCE, &corners, @sizeOf(u32));
 
     const edit = c.CreateWindowExW(
@@ -395,7 +395,10 @@ fn onPaint(self: *SearchBar, hwnd: c.HWND) void {
         const rect = l.button(which);
         const pressed = self.pressed == which;
         const hovered = self.hover == which and (self.pressed == null or pressed);
-        if (pressed) buf.fill(rect, palette.selected) else if (hovered) buf.fill(rect, palette.hover);
+        if (pressed or hovered) {
+            const r: paint.Rect = .from(rect);
+            buf.round(r, r.w / 2, palette.fg, if (pressed) 0.2 else 0.1);
+        }
         buf.text(glyph, rect, self.font, if (hovered) palette.fg else palette.dim, c.DT_CENTER);
     }
 }

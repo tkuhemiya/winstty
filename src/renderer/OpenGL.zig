@@ -56,6 +56,10 @@ device: *const Device,
 
 context: if (use_wgl) wgl.Context else *gl.egl.Context,
 
+/// The surface we present to, and what dims it.
+rt_surface: if (use_wgl) *apprt.Surface else void,
+dimmer: if (use_wgl) ?wgl.Dimmer else void = if (use_wgl) null else {},
+
 pub fn init(
     alloc: Allocator,
     device: *const Device,
@@ -71,6 +75,7 @@ pub fn init(
             MIN_VERSION_MAJOR,
             MIN_VERSION_MINOR,
         ),
+        .rt_surface = opts.rt_surface,
     };
 
     const display = device.display;
@@ -105,6 +110,7 @@ pub fn init(
         .blending = opts.config.blending,
         .device = device,
         .context = context,
+        .rt_surface = {},
     };
 }
 
@@ -243,10 +249,11 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
 /// thread; unbinds the context from this thread so it can be destroyed on
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
-    if (comptime use_wgl)
-        wgl.Context.releaseCurrent()
-    else
-        self.device.display.releaseCurrent();
+    if (comptime use_wgl) {
+        if (self.dimmer) |v| v.deinit();
+        self.dimmer = null;
+        wgl.Context.releaseCurrent();
+    } else self.device.display.releaseCurrent();
     gl.glad.unload();
 }
 
@@ -318,6 +325,11 @@ pub fn present(
 ) !ExportedFrame {
     if (comptime use_wgl) {
         try target.blitToScreen();
+        const dim = self.rt_surface.dim.load(.acquire);
+        if (dim >> 24 > 0) {
+            if (self.dimmer == null) self.dimmer = try .init();
+            try self.dimmer.?.draw(dim);
+        }
         try self.context.swap();
         return;
     }

@@ -9,6 +9,7 @@ const Window = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const Config = @import("../../config.zig").Config;
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const App = @import("App.zig");
 const CommandPalette = @import("CommandPalette.zig");
@@ -24,11 +25,20 @@ pub const Tree = SplitTree(Surface);
 const WM_CLOSE_TAB = c.WM_APP + 1;
 
 // 96 DPI lengths.
-const tab_bar_height = 34;
-const tab_max_width = 220;
-const tab_button_width = 34;
-const tab_close_width = 28;
+const title_height = 40;
+const strip_height = 44;
+const strip_margin = 8;
+const pill_height = 32;
+const pill_inset = 3;
+const button_size = 13;
+const button_gap = 9;
+const button_margin = 15;
+const close_size = 18;
 const divider_width = 5;
+const resize_band = 5;
+
+const animation_timer = 1;
+const animation_ms = 15;
 
 pub const Tab = struct {
     /// Unique for the life of the app, so it can be posted in messages.
@@ -70,13 +80,18 @@ const Hit = union(enum) {
     tab: usize,
     tab_close: usize,
     new_tab,
-    bar,
+    button: Button,
+
+    /// Anywhere else at the top, which moves the window.
+    caption,
     divider: usize,
 
     fn eql(a: Hit, b: Hit) bool {
         return std.meta.eql(a, b);
     }
 };
+
+const Button = enum { close, minimize, zoom };
 
 const Drag = union(enum) {
     none,
@@ -95,6 +110,16 @@ hover: Hit = .none,
 drag: Drag = .none,
 tracking_leave: bool = false,
 font: ?c.HFONT = null,
+font_bold: ?c.HFONT = null,
+font_icon: ?c.HFONT = null,
+
+/// Where the selection is drawn, as a tab index. It moves towards `active`.
+selection: f32 = 0,
+animating: bool = false,
+
+/// Whether we look active. That's also so while one of our popups is.
+is_active: bool = true,
+tracking_nc_leave: bool = false,
 size_limit: apprt.action.SizeLimit = .{
     .min_width = 0,
     .min_height = 0,
@@ -188,7 +213,9 @@ fn deinit(self: *Window) void {
     self.tabs.deinit(alloc);
     self.dividers.deinit(alloc);
     if (self.title_override) |v| alloc.free(v);
-    if (self.font) |v| _ = c.DeleteObject(v);
+    for ([_]?c.HFONT{ self.font, self.font_bold, self.font_icon }) |font| {
+        if (font) |v| _ = c.DeleteObject(v);
+    }
     alloc.destroy(self);
 }
 
@@ -241,6 +268,7 @@ fn insertTab(self: *Window, index: usize, tab: Tab) void {
     if (self.activeTab()) |v| setTabVisible(v, false);
     self.tabs.insertAssumeCapacity(index, tab);
     self.active = index;
+    if (self.tabs.items.len == 1) self.selection = 0;
     self.refresh();
     self.focusActive();
 }
@@ -555,6 +583,7 @@ pub fn surfaceFocused(self: *Window, surface: *Surface) void {
     const loc = self.locate(surface) orelse return;
     if (loc.tab.focused == surface) return;
     loc.tab.focused = surface;
+    syncDimming(loc.tab);
     self.titleChanged(surface);
 }
 
@@ -620,10 +649,97 @@ fn barVisible(self: *const Window) bool {
     };
 }
 
+const Style = @FieldType(Config, "macos-titlebar-style");
+
+/// The macOS styles make as much sense here, so we share the configuration.
+fn titlebarStyle(self: *const Window) Style {
+    const config = &self.app.config;
+    if (config.@"window-decoration" == .none) return .hidden;
+    return config.@"macos-titlebar-style";
+}
+
+/// Whether we draw the title bar, rather than Windows.
+fn customFrame(self: *const Window) bool {
+    return self.windowed == null and self.titlebarStyle() != .native;
+}
+
+/// The title bar if we're the one drawing it.
+fn titleRect(self: *const Window) c.RECT {
+    var rect = self.clientRect();
+    rect.bottom = if (self.windowed != null) 0 else switch (self.titlebarStyle()) {
+        .native, .hidden => 0,
+        .transparent => self.scaled(title_height),
+        .tabs => self.scaled(strip_height),
+    };
+    return rect;
+}
+
+fn tabsInTitle(self: *const Window) bool {
+    return self.titlebarStyle() == .tabs and self.titleRect().bottom > 0;
+}
+
+/// The strip that holds the tabs.
+fn stripRect(self: *const Window) c.RECT {
+    var rect = self.titleRect();
+    if (!self.barVisible()) {
+        rect.top = rect.bottom;
+        return rect;
+    }
+    if (self.tabsInTitle()) {
+        rect.left = self.buttonsWidth();
+        return rect;
+    }
+
+    // The title bar already provides the space above.
+    const overlap: c_int = if (rect.bottom > 0) self.scaled(6) else 0;
+    rect.top = rect.bottom - overlap;
+    rect.bottom = rect.top + self.scaled(strip_height);
+    return rect;
+}
+
+/// Everything we draw above the surfaces.
 fn barRect(self: *const Window) c.RECT {
     var rect = self.clientRect();
-    rect.bottom = if (self.barVisible()) self.scaled(tab_bar_height) else 0;
+    rect.bottom = @max(self.titleRect().bottom, self.stripRect().bottom);
     return rect;
+}
+
+fn buttonsVisible(self: *const Window) bool {
+    return self.titleRect().bottom > 0 and self.app.config.@"macos-window-buttons" == .visible;
+}
+
+fn buttonsWidth(self: *const Window) c_int {
+    if (!self.buttonsVisible()) return 0;
+    return self.scaled(button_margin * 2 + button_size * 3 + button_gap * 2 - strip_margin);
+}
+
+fn buttonRect(self: *const Window, button: Button) c.RECT {
+    const size = self.scaled(button_size);
+    const index: c_int = @backingInt(button);
+    const left = self.scaled(button_margin) + index * (size + self.scaled(button_gap));
+    const top = @divTrunc(self.titleRect().bottom - size, 2);
+    return .{ .left = left, .top = top, .right = left + size, .bottom = top + size };
+}
+
+/// The capsule that holds the tabs.
+fn pillRect(self: *const Window) c.RECT {
+    const strip = self.stripRect();
+    const height = self.scaled(pill_height);
+    const margin = self.scaled(strip_margin);
+    const top = strip.top + @divTrunc(strip.bottom - strip.top - height, 2);
+    return .{
+        .left = strip.left + margin,
+        .top = top,
+        // The button to make a new tab is a circle next to it.
+        .right = @max(strip.left + margin + 1, strip.right - margin * 2 - height),
+        .bottom = top + height,
+    };
+}
+
+fn newTabRect(self: *const Window) c.RECT {
+    const pill = self.pillRect();
+    const left = pill.right + self.scaled(strip_margin);
+    return .{ .left = left, .top = pill.top, .right = left + pill.bottom - pill.top, .bottom = pill.bottom };
 }
 
 /// The area of the client that holds surfaces.
@@ -637,6 +753,7 @@ fn contentRect(self: *const Window) c.RECT {
 pub fn refresh(self: *Window) void {
     self.relayout();
     self.updateTitle();
+    self.invalidateBar();
     _ = c.InvalidateRect(self.hwnd, null, 0);
 }
 
@@ -644,6 +761,7 @@ fn relayout(self: *Window) void {
     self.dividers.clearRetainingCapacity();
     if (self.minimized) return;
     const tab = self.activeTab() orelse return;
+    syncDimming(tab);
     const content = self.contentRect();
     if (tab.tree.zoomed) |zoomed| {
         var it = tab.tree.iterator();
@@ -699,6 +817,13 @@ fn layoutNode(self: *Window, tab: *Tab, handle: Tree.Node.Handle, area: c.RECT) 
     }
 }
 
+/// Dim the splits that don't have the focus.
+fn syncDimming(tab: *Tab) void {
+    const split = tab.tree.isSplit();
+    var it = tab.tree.iterator();
+    while (it.next()) |entry| entry.view.setDimmed(split and entry.view != tab.focused);
+}
+
 /// Popups we own don't move with us.
 fn repositionOverlays(self: *Window) void {
     if (self.palette) |v| v.reposition();
@@ -732,7 +857,9 @@ pub fn setSurfaceSize(self: *Window, surface: *const Surface, width: u32, height
 /// Grow a client rect to include the window frame.
 fn adjustRect(self: *const Window, rect: *c.RECT) void {
     const style: u32 = @truncate(@as(usize, @bitCast(c.GetWindowLongPtrW(self.hwnd, c.GWL_STYLE))));
+    const top = rect.top;
     _ = c.AdjustWindowRectExForDpi(rect, style, 0, 0, self.getDpi());
+    if (self.customFrame()) rect.top = top;
 }
 
 pub fn toggleMaximize(self: *Window) void {
@@ -793,6 +920,7 @@ pub fn present(self: *Window, surface: *Surface) void {
 
 pub fn configChanged(self: *Window) void {
     self.syncAppearance();
+    self.updateFont();
     for (self.tabs.items) |*tab| {
         var it = tab.tree.iterator();
         while (it.next()) |entry| {
@@ -829,6 +957,23 @@ fn syncAppearance(self: *Window) void {
     }
     _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_CAPTION_COLOR, &caption, @sizeOf(u32));
     _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_TEXT_COLOR, &caption_text, @sizeOf(u32));
+
+    // A hairline that suits the background, and the largest corners there are.
+    const border = palette.bg.mix(palette.fg, 45).ref();
+    _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_BORDER_COLOR, &border, @sizeOf(u32));
+    const corners: u32 = c.DWMWCP_ROUND;
+    _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_WINDOW_CORNER_PREFERENCE, &corners, @sizeOf(u32));
+
+    // The frame depends on the style.
+    _ = c.SetWindowPos(
+        self.hwnd,
+        null,
+        0,
+        0,
+        0,
+        0,
+        c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_FRAMECHANGED,
+    );
 }
 
 /// The opacity (0 to 255) of the terminal background.
@@ -891,25 +1036,76 @@ fn syncTransparency(self: *Window) void {
 }
 
 fn updateFont(self: *Window) void {
-    if (self.font) |v| _ = c.DeleteObject(v);
-    self.font = paint.uiFont(9, self.getDpi());
+    for ([_]?c.HFONT{ self.font, self.font_bold, self.font_icon }) |font| {
+        if (font) |v| _ = c.DeleteObject(v);
+    }
+    const value = self.getDpi();
+    const alloc = self.app.core_app.alloc;
+    const custom: ?[:0]u16 = if (self.app.config.@"window-title-font-family") |v|
+        std.unicode.wtf8ToWtf16LeAllocZ(alloc, v) catch null
+    else
+        null;
+    defer if (custom) |v| alloc.free(v);
+    const family: [*:0]const u16 = if (custom) |v| v.ptr else c.L("Segoe UI Variable Text");
+    self.font = paint.font(family, 9, 400, value);
+    self.font_bold = paint.font(family, 9, 600, value);
+    self.font_icon = paint.iconFont(7, value);
 }
 
 fn invalidateBar(self: *Window) void {
     const rect = self.barRect();
     if (rect.bottom > 0) _ = c.InvalidateRect(self.hwnd, &rect, 0);
+
+    const target: f32 = @floatFromInt(self.active);
+    if (self.selection != target and !self.animating) {
+        self.animating = c.SetTimer(self.hwnd, animation_timer, animation_ms, null) != 0;
+    }
 }
 
-fn tabWidth(self: *const Window) c_int {
-    const len: c_int = @intCast(@max(1, self.tabs.items.len));
-    const space = self.clientRect().right - self.scaled(tab_button_width);
-    return @max(1, @min(self.scaled(tab_max_width), @divTrunc(space, len)));
+/// Move the selection a step closer to the active tab.
+fn animate(self: *Window) void {
+    const target: f32 = @floatFromInt(self.active);
+    const remaining = target - self.selection;
+    if (@abs(remaining) < 0.01) {
+        self.selection = target;
+        self.animating = false;
+        _ = c.KillTimer(self.hwnd, animation_timer);
+    } else {
+        self.selection += remaining * 0.3;
+    }
+    const rect = self.barRect();
+    _ = c.InvalidateRect(self.hwnd, &rect, 0);
+}
+
+fn tabWidth(self: *const Window) f32 {
+    const pill = self.pillRect();
+    return @as(f32, @floatFromInt(pill.right - pill.left)) /
+        @as(f32, @floatFromInt(@max(1, self.tabs.items.len)));
+}
+
+/// The area of a tab, which may be between two.
+fn tabArea(self: *const Window, position: f32) paint.Rect {
+    const pill: paint.Rect = .from(self.pillRect());
+    const width = self.tabWidth();
+    return .{ .x = pill.x + width * position, .y = pill.y, .w = width, .h = pill.h };
 }
 
 fn tabRect(self: *const Window, index: usize) c.RECT {
-    const width = self.tabWidth();
-    const left = width * @as(c_int, @intCast(index));
-    return .{ .left = left, .top = 0, .right = left + width, .bottom = self.barRect().bottom };
+    const r = self.tabArea(@floatFromInt(index));
+    return .{
+        .left = @intFromFloat(r.x),
+        .top = @intFromFloat(r.y),
+        .right = @intFromFloat(r.x + r.w),
+        .bottom = @intFromFloat(r.y + r.h),
+    };
+}
+
+fn closeRect(self: *const Window, index: usize) c.RECT {
+    const tab = self.tabRect(index);
+    const size = self.scaled(close_size);
+    const top = tab.top + @divTrunc(tab.bottom - tab.top - size, 2);
+    const left = tab.left + @divTrunc(tab.bottom - tab.top - size, 2);
+    return .{ .left = left, .top = top, .right = left + size, .bottom = top + size };
 }
 
 fn onPaint(self: *Window) void {
@@ -918,61 +1114,171 @@ fn onPaint(self: *Window) void {
     defer _ = c.EndPaint(self.hwnd, &ps);
 
     const palette: paint.Palette = .init(&self.app.config);
+    const opacity = self.backgroundOpacity();
     for (self.dividers.items) |divider| {
         var buf = paint.Buffer.begin(dc, divider.rect) orelse continue;
-        buf.opacity = self.backgroundOpacity();
         defer buf.end();
+        buf.base(palette.bg, opacity);
         const r = divider.rect;
-        var line: c.RECT = .{ .right = r.right - r.left, .bottom = r.bottom - r.top };
-        buf.fill(line, palette.bg);
+        var line: paint.Rect = .{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(r.right - r.left),
+            .h = @floatFromInt(r.bottom - r.top),
+        };
         // A thin line in the middle of a gap that's wide enough to grab.
-        const thickness = @max(1, self.scaled(1));
+        const thickness: f32 = @floatFromInt(@max(1, self.scaled(1)));
         switch (divider.layout) {
             .horizontal => {
-                line.left = @divTrunc(line.right - thickness, 2);
-                line.right = line.left + thickness;
+                line.x = @floor((line.w - thickness) / 2);
+                line.w = thickness;
             },
             .vertical => {
-                line.top = @divTrunc(line.bottom - thickness, 2);
-                line.bottom = line.top + thickness;
+                line.y = @floor((line.h - thickness) / 2);
+                line.h = thickness;
             },
         }
-        buf.fill(line, palette.divider);
+        buf.round(line, 0, palette.divider, 1);
     }
 
     const bar = self.barRect();
     if (bar.bottom == 0) return;
-    const buf = paint.Buffer.begin(dc, bar) orelse return;
+    var buf = paint.Buffer.begin(dc, bar) orelse return;
     defer buf.end();
-    buf.fill(bar, palette.bar);
+    buf.base(palette.bg, opacity);
+    if (self.buttonsVisible()) self.paintButtons(buf, palette);
+    if (self.barVisible()) self.paintTabs(buf, palette) else self.paintTitle(buf, palette);
+    if (self.barVisible() and !self.tabsInTitle()) self.paintTitle(buf, palette);
+}
 
-    const pad = self.scaled(10);
+/// Scales alpha down for windows that aren't active.
+fn emphasis(self: *const Window) f32 {
+    return if (self.is_active) 1 else 0.5;
+}
+
+fn paintTitle(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
+    var rect = self.titleRect();
+    if (rect.bottom == 0) return;
+    const tab = self.activeTab() orelse return;
+
+    // Centered in the window, as long as it stays clear of the buttons.
+    const side = @max(self.buttonsWidth(), self.scaled(strip_margin));
+    rect.left += side;
+    rect.right -= side;
+    if (rect.right <= rect.left) return;
+    buf.blendText(
+        self.title_override orelse tab.title(),
+        rect,
+        self.font_bold,
+        palette.fg,
+        0.85 * self.emphasis(),
+        c.DT_CENTER,
+    );
+}
+
+fn paintButtons(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
+    const over = self.hover == .button;
+    for (std.enums.values(Button)) |button| {
+        const r: paint.Rect = .from(self.buttonRect(button));
+        const radius = r.w / 2;
+        if (!self.is_active and !over) {
+            buf.round(r, radius, palette.fg, 0.2);
+            continue;
+        }
+        const color: paint.Rgb = switch (button) {
+            .close => .{ .r = 0xFF, .g = 0x5F, .b = 0x57 },
+            .minimize => .{ .r = 0xFE, .g = 0xBC, .b = 0x2E },
+            .zoom => .{ .r = 0x28, .g = 0xC8, .b = 0x40 },
+        };
+        const black: paint.Rgb = .{ .r = 0, .g = 0, .b = 0 };
+        buf.round(r, radius, color, 1);
+        buf.ring(r, radius, black, 0.08, 0.18);
+        if (!over) continue;
+
+        // The symbols are shown all at once, for hovering any.
+        const cx = r.x + r.w / 2;
+        const cy = r.y + r.h / 2;
+        const arm = r.w * 0.27;
+        const line = @max(1.2, r.w * 0.11);
+        switch (button) {
+            .close => {
+                buf.stroke(cx - arm, cy - arm, cx + arm, cy + arm, line, black, 0.55);
+                buf.stroke(cx - arm, cy + arm, cx + arm, cy - arm, line, black, 0.55);
+            },
+            .minimize => buf.stroke(cx - arm * 1.2, cy, cx + arm * 1.2, cy, line, black, 0.55),
+            .zoom => {
+                buf.stroke(cx - arm * 1.2, cy, cx + arm * 1.2, cy, line, black, 0.55);
+                buf.stroke(cx, cy - arm * 1.2, cx, cy + arm * 1.2, line, black, 0.55);
+            },
+        }
+    }
+}
+
+fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
+    const strength = self.emphasis();
+    const pill: paint.Rect = .from(self.pillRect());
+    buf.glass(pill, pill.h / 2, palette.fg, 0.09);
+
+    // The selection is a smaller capsule, concentric with the outer one.
+    const inset: f32 = @floatFromInt(self.scaled(pill_inset));
+    const last: f32 = @floatFromInt(self.tabs.items.len - 1);
+    const selection = self.tabArea(std.math.clamp(self.selection, 0, last)).inset(inset);
+    if (palette.bg.isDark()) {
+        buf.glass(selection, selection.h / 2, palette.fg, 0.07 + 0.08 * strength);
+    } else {
+        // On a light background, what's raised is brighter than its surroundings.
+        buf.round(selection, selection.h / 2, .{ .r = 255, .g = 255, .b = 255 }, 0.45 + 0.5 * strength);
+        buf.ring(selection, selection.h / 2, palette.fg, 0.05, 0.16);
+    }
+
     for (self.tabs.items, 0..) |*tab, i| {
-        const rect = self.tabRect(i);
         const active = i == self.active;
         const hovered = switch (self.hover) {
             .tab, .tab_close => |v| v == i,
             else => false,
         };
-        if (active) buf.fill(rect, palette.bg) else if (hovered) buf.fill(rect, palette.hover);
+        const area = self.tabArea(@floatFromInt(i));
+        if (hovered and !active) {
+            const r = area.inset(inset);
+            buf.round(r, r.h / 2, palette.fg, 0.05);
+        }
 
-        var close = rect;
-        close.left = close.right - self.scaled(tab_close_width);
-        var label = rect;
-        label.left += pad;
-        label.right = close.left;
-        const color = if (active) palette.fg else palette.dim;
-        buf.text(tab.title(), label, self.font, color, 0);
-        if (active or hovered) {
+        // Between tabs that are both plain.
+        if (i > 0 and !active and i - 1 != self.active and !self.animating) {
+            buf.round(.{ .x = @floor(area.x), .y = area.y + area.h * 0.3, .w = 1, .h = area.h * 0.4 }, 0, palette.fg, 0.14);
+        }
+
+        // Centered, so leave the same space as the close button on the right.
+        const close = self.closeRect(i);
+        var label = self.tabRect(i);
+        const side = close.right - label.left + self.scaled(2);
+        label.left += side;
+        label.right -= side;
+        var number: [8]u8 = undefined;
+        const title = std.mem.trim(u8, tab.title(), " ");
+        if (label.right > label.left) buf.blendText(
+            // A fixed blank title is a way of hiding the one of the window, but
+            // tabs need something to tell them apart.
+            if (title.len > 0) title else std.fmt.bufPrint(&number, "{}", .{i + 1}) catch "",
+            label,
+            if (active) self.font_bold else self.font,
+            palette.fg,
+            (if (active) @as(f32, 0.95) else 0.6) * strength,
+            c.DT_CENTER,
+        );
+
+        if (hovered) {
             const on_close = self.hover.eql(.{ .tab_close = i });
-            buf.text("✕", close, self.font, if (on_close) palette.fg else palette.dim, c.DT_CENTER);
+            const r: paint.Rect = .from(close);
+            if (on_close) buf.round(r, r.w / 2, palette.fg, 0.16);
+            buf.blendText(paint.icon.cancel, close, self.font_icon, palette.fg, if (on_close) 0.95 else 0.6, c.DT_CENTER);
         }
     }
 
-    var plus = self.tabRect(self.tabs.items.len);
-    plus.right = plus.left + self.scaled(tab_button_width);
-    if (self.hover == .new_tab) buf.fill(plus, palette.hover);
-    buf.text("＋", plus, self.font, palette.dim, c.DT_CENTER);
+    const plus = self.newTabRect();
+    const r: paint.Rect = .from(plus);
+    buf.glass(r, r.w / 2, palette.fg, if (self.hover == .new_tab) 0.18 else 0.09);
+    buf.blendText(paint.icon.add, plus, self.font_icon, palette.fg, 0.8 * strength, c.DT_CENTER);
 }
 
 //---------------------------------------------------------------
@@ -984,15 +1290,32 @@ fn contains(rect: c.RECT, x: c_int, y: c_int) bool {
 
 fn hitTest(self: *const Window, x: c_int, y: c_int) Hit {
     if (contains(self.barRect(), x, y)) {
-        const index: usize = @intCast(@divTrunc(x, self.tabWidth()));
-        if (index < self.tabs.items.len) {
-            const rect = self.tabRect(index);
-            if (x >= rect.right - self.scaled(tab_close_width)) return .{ .tab_close = index };
-            return .{ .tab = index };
+        if (self.buttonsVisible()) {
+            // The gaps belong to the buttons, to make them easier to hit.
+            for (std.enums.values(Button)) |button| {
+                var r = self.buttonRect(button);
+                const gap = @divTrunc(self.scaled(button_gap) + 1, 2);
+                r.left -= gap;
+                r.right += gap;
+                r.top -= gap;
+                r.bottom += gap;
+                if (contains(r, x, y)) return .{ .button = button };
+            }
         }
-        const left = self.tabRect(self.tabs.items.len).left;
-        if (x < left + self.scaled(tab_button_width)) return .new_tab;
-        return .bar;
+        if (self.barVisible()) {
+            const pill = self.pillRect();
+            if (contains(pill, x, y)) {
+                const offset: f32 = @floatFromInt(x - pill.left);
+                const index: usize = @min(
+                    self.tabs.items.len - 1,
+                    @as(usize, @intFromFloat(@max(0, offset / self.tabWidth()))),
+                );
+                if (contains(self.closeRect(index), x, y)) return .{ .tab_close = index };
+                return .{ .tab = index };
+            }
+            if (contains(self.newTabRect(), x, y)) return .new_tab;
+        }
+        return .caption;
     }
     for (self.dividers.items, 0..) |divider, i| {
         if (contains(divider.rect, x, y)) return .{ .divider = i };
@@ -1012,7 +1335,8 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
             if (!drag.moving and @abs(x - drag.start_x) > self.scaled(6)) drag.moving = true;
             if (drag.moving and self.tabs.items.len > 0) {
                 const max = self.tabs.items.len - 1;
-                const to: usize = @min(max, @as(usize, @intCast(@max(0, @divTrunc(x, self.tabWidth())))));
+                const offset: f32 = @floatFromInt(@max(0, x - self.pillRect().left));
+                const to: usize = @min(max, @as(usize, @intFromFloat(offset / self.tabWidth())));
                 self.moveTabTo(self.active, to);
             }
         },
@@ -1034,16 +1358,44 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
         },
     }
 
-    const hover = self.hitTest(x, y);
-    if (!hover.eql(self.hover)) {
-        self.hover = hover;
-        self.invalidateBar();
-    }
+    self.setHover(self.hitTest(x, y));
+}
+
+fn setHover(self: *Window, hover: Hit) void {
+    if (hover.eql(self.hover)) return;
+    self.hover = hover;
+    self.invalidateBar();
+}
+
+/// The button a non-client message is about.
+fn ncButton(hit: c.WPARAM) ?Button {
+    return switch (hit) {
+        c.HTCLOSE => .close,
+        c.HTMINBUTTON => .minimize,
+        c.HTMAXBUTTON => .zoom,
+        else => null,
+    };
+}
+
+fn frameThickness(self: *const Window) c_int {
+    const SM_CYSIZEFRAME = 33;
+    const SM_CXPADDEDBORDER = 92;
+    return c.GetSystemMetricsForDpi(SM_CYSIZEFRAME, self.getDpi()) +
+        c.GetSystemMetricsForDpi(SM_CXPADDEDBORDER, self.getDpi());
+}
+
+/// Whether a screen position is at the top edge, which resizes the window. The
+/// other edges are outside of the client area.
+pub fn inResizeBand(self: *const Window, y: c_int) bool {
+    if (!self.customFrame() or c.IsZoomed(self.hwnd) != 0) return false;
+    var rect: c.RECT = .{};
+    _ = c.GetWindowRect(self.hwnd, &rect);
+    return y >= rect.top and y < rect.top + self.scaled(resize_band);
 }
 
 fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
     switch (self.hitTest(x, y)) {
-        .none, .bar => {},
+        .none, .caption, .button => {},
         .tab => |i| {
             self.selectTab(i);
             self.drag = .{ .tab = .{ .start_x = x } };
@@ -1061,7 +1413,7 @@ fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
 
 fn onDoubleClick(self: *Window, x: c_int, y: c_int) !void {
     switch (self.hitTest(x, y)) {
-        .bar => _ = try self.newTab(.tab),
+        .caption => _ = try self.newTab(.tab),
         .divider => if (self.activeSurface()) |v| {
             _ = try self.equalizeSplits(v);
         },
@@ -1111,6 +1463,86 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
 
         c.WM_DESTROY => self.deinit(),
         c.WM_PAINT => self.onPaint(),
+        c.WM_TIMER => if (wparam == animation_timer) self.animate(),
+
+        c.WM_NCCALCSIZE => {
+            if (wparam == 0 or !self.customFrame()) return null;
+
+            // Keep the borders that Windows uses for resizing and the shadow,
+            // but have the client area reach the top.
+            const rect: *c.RECT = @ptrFromInt(bits);
+            const top = rect.top;
+            const result = c.DefWindowProcW(self.hwnd, msg, wparam, lparam);
+            if (result != 0) return result;
+            rect.top = top;
+
+            // A maximized window's borders are outside of the monitor.
+            if (c.IsZoomed(self.hwnd) != 0) rect.top += self.frameThickness();
+            return 0;
+        },
+
+        c.WM_NCACTIVATE => {
+            if (!self.customFrame()) return null;
+            // This parameter keeps Windows from drawing the title bar.
+            return c.DefWindowProcW(self.hwnd, msg, wparam, -1);
+        },
+
+        c.WM_ACTIVATE => {
+            const other: ?c.HWND = @ptrFromInt(bits);
+            self.is_active = wparam & 0xFFFF != 0 or
+                (other != null and c.GetWindow(other.?, c.GW_OWNER) == self.hwnd);
+            self.invalidateBar();
+            return null;
+        },
+
+        c.WM_NCHITTEST => {
+            const result = c.DefWindowProcW(self.hwnd, msg, wparam, lparam);
+            if (result != c.HTCLIENT or !self.customFrame()) return result;
+            var point: c.POINT = .{ .x = x, .y = y };
+            if (self.inResizeBand(y)) return c.HTTOP;
+            _ = c.ScreenToClient(self.hwnd, &point);
+            return switch (self.hitTest(point.x, point.y)) {
+                .caption => c.HTCAPTION,
+                .button => |v| switch (v) {
+                    .close => c.HTCLOSE,
+                    .minimize => c.HTMINBUTTON,
+                    // This is what makes Windows offer snap layouts.
+                    .zoom => c.HTMAXBUTTON,
+                },
+                else => c.HTCLIENT,
+            };
+        },
+
+        c.WM_NCMOUSEMOVE => {
+            if (!self.customFrame()) return null;
+            if (!self.tracking_nc_leave) {
+                var track: c.TRACKMOUSEEVENT = .{
+                    .dwFlags = c.TME_LEAVE | c.TME_NONCLIENT,
+                    .hwndTrack = self.hwnd,
+                };
+                self.tracking_nc_leave = c.TrackMouseEvent(&track) != 0;
+            }
+            self.setHover(if (ncButton(wparam)) |v| .{ .button = v } else .caption);
+            return null;
+        },
+        c.WM_NCMOUSELEAVE => {
+            self.tracking_nc_leave = false;
+            self.setHover(.none);
+            return null;
+        },
+
+        // Windows would draw its own buttons as pressed.
+        c.WM_NCLBUTTONDOWN, c.WM_NCLBUTTONDBLCLK => {
+            if (!self.customFrame() or ncButton(wparam) == null) return null;
+        },
+        c.WM_NCLBUTTONUP => {
+            if (!self.customFrame()) return null;
+            switch (ncButton(wparam) orelse return null) {
+                .close => _ = c.PostMessageW(self.hwnd, c.WM_CLOSE, 0, 0),
+                .minimize => _ = c.ShowWindow(self.hwnd, c.SW_MINIMIZE),
+                .zoom => self.toggleMaximize(),
+            }
+        },
         c.WM_ERASEBKGND => return 1,
 
         c.WM_SIZE => {

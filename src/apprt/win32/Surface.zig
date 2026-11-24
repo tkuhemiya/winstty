@@ -39,6 +39,10 @@ visible: bool = false,
 
 search: ?*SearchBar = null,
 inspector: ?*InspectorWindow = null,
+/// The color (0xAARRGGBB) drawn over this surface, for splits without focus.
+/// Read by the render thread.
+dim: std.atomic.Value(u32) = .init(0),
+
 scrollbar: ?*Scrollbar = null,
 scrollbar_state: terminal.Scrollbar = .zero,
 
@@ -300,6 +304,20 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     if (self.search) |v| v.reposition();
 }
 
+pub fn setDimmed(self: *Surface, dimmed: bool) void {
+    const config = &self.app.config;
+    const value: u32 = value: {
+        if (!dimmed) break :value 0;
+        const opacity = std.math.clamp(config.@"unfocused-split-opacity", 0, 1);
+        const color = config.@"unfocused-split-fill" orelse config.background;
+        const alpha: u32 = @intFromFloat(@round((1 - opacity) * 255));
+        break :value alpha << 24 | @as(u32, color.r) << 16 | @as(u32, color.g) << 8 | color.b;
+    };
+    if (self.dim.swap(value, .acq_rel) == value) return;
+    self.core_surface.refreshCallback() catch |err|
+        log.warn("error refreshing surface err={}", .{err});
+}
+
 /// Whether there's any point in rendering.
 pub fn setOccluded(self: *Surface, occluded: bool) void {
     self.core_surface.occlusionCallback(!occluded) catch |err|
@@ -442,6 +460,12 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
                 c.L("The running process in this terminal will be terminated."),
             )) return 0;
             try self.window.closeSurface(self);
+        },
+
+        c.WM_NCHITTEST => {
+            const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16)));
+            if (self.window.inResizeBand(y)) return c.HTTRANSPARENT;
+            return null;
         },
 
         c.WM_PAINT => {
