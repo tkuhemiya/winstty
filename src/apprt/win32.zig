@@ -10,4 +10,5 @@ pub const resourcesDir = internal_os.resourcesDir;
 test {
     _ = App;
     _ = Surface;
+    _ = @import("win32/CommandPalette.zig");
 }

@@ -424,3 +424,16 @@ pub extern "user32" fn SetActiveWindow(HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
 pub extern "user32" fn GetWindowTextLengthW(HWND) callconv(.winapi) c_int;
 pub extern "gdi32" fn SetBkColor(HDC, COLORREF) callconv(.winapi) COLORREF;
+
+//---------------------------------------------------------------
+// Command palette
+
+
+pub const EM_SETLIMITTEXT = 0x00C5;
+pub const EM_SETCUEBANNER = 0x1501;
+pub const WA_INACTIVE = 0;
+
+pub const DT_LEFT = 0x0;
+pub const DT_CALCRECT = 0x400;
+
+pub const DWMWCP_ROUND: u32 = 2;

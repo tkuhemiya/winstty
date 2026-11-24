@@ -1,12 +1,103 @@
-//! The command palette of a window.
+//! The command palette of a window: a search field above a list of commands.
+//!
+//! It's an owned popup rather than a child, because the app may be composited
+//! with per-pixel alpha, which a child can't opt out of. The popup is created
+//! the first time it's opened and then only hidden and shown, so closing it
+//! never destroys a window from inside one of its own callbacks. The list is
+//! painted by hand, as a native list box can't show the keybinds or the
+//! hover state we want.
+//!
+//! Commands are copied when the palette opens. The config can be reloaded
+//! while it's open, and an action may do exactly that.
 const CommandPalette = @This();
 
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const input = @import("../../input.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
+const paint = @import("paint.zig");
+
+const log = std.log.scoped(.win32);
+
+const class_name = c.L("GhosttyPalette");
+
+// 96 DPI lengths.
+const palette_width = 560;
+const palette_max_height = 400;
+const palette_top = 60;
+const palette_margin = 16;
+const input_height = 46;
+const edit_height = 24;
+const padding = 16;
+const row_height = 34;
+const footer_height = 28;
+const scrollbar_width = 4;
+
+/// What a row shows, and what's searched.
+pub const Item = struct {
+    title: []const u8,
+    description: []const u8,
+    action: input.Binding.Action,
+    /// The action in the syntax of the config. Users know actions by this
+    /// name from `keybind`, so it's searchable as well as the title.
+    action_text: []const u8,
+    /// Empty if the action isn't bound.
+    keybind: []const u8,
+};
+
+/// The items of an open palette, and the memory they point to.
+const Loaded = struct {
+    arena: ArenaAllocator,
+    items: []const Item,
+};
+
+/// The original procedure of the EDIT class, which every subclassed field
+/// shares.
+var edit_proc: ?c.WNDPROC = null;
 
 window: *Window,
 
-pub fn register(_: c.HINSTANCE) !void {}
+/// The popup and its search field. Null until first opened, and after either
+/// is destroyed.
+hwnd: ?c.HWND = null,
+edit: ?c.HWND = null,
+
+edit_font: ?c.HFONT = null,
+list_font: ?c.HFONT = null,
+/// Background of the search field.
+brush: ?c.HGDIOBJ = null,
+colors: paint.Palette = undefined,
+dpi: u32 = 96,
+
+/// True from showing until closing starts.
+open: bool = false,
+/// Set while closing, as hiding the popup deactivates it.
+closing: bool = false,
+/// Set once our window is going away.
+destroying: bool = false,
+
+loaded: ?Loaded = null,
+/// Indices of the items matching the query, best first.
+shown: std.ArrayList(u32) = .empty,
+/// Position in `shown`.
+selected: usize = 0,
+/// Pixels scrolled off the top of the list.
+scroll: c_int = 0,
+hover: ?usize = null,
+/// The row a mouse button went down on.
+pressed: ?usize = null,
+tracking_leave: bool = false,
+
+pub fn register(hinstance: c.HINSTANCE) !void {
+    if (c.RegisterClassExW(&.{
+        .lpfnWndProc = wndProc,
+        .hInstance = hinstance,
+        .hCursor = c.LoadCursorW(null, c.IDC_ARROW),
+        .lpszClassName = class_name,
+    }) == 0) return error.Win32Failed;
+}
 
 pub fn create(window: *Window) !*CommandPalette {
     const self = try window.app.core_app.alloc.create(CommandPalette);
@@ -14,12 +105,989 @@ pub fn create(window: *Window) !*CommandPalette {
     return self;
 }
 
-/// Called when the window is destroyed.
+/// Called when the window is destroyed. Our popup is owned by the window, so
+/// it may already be gone, or it may still be there.
 pub fn destroy(self: *CommandPalette) void {
-    self.window.app.core_app.alloc.destroy(self);
+    const alloc = self.window.app.core_app.alloc;
+    self.destroying = true;
+    self.window.palette = null;
+    if (self.hwnd) |v| _ = c.DestroyWindow(v);
+    self.unload();
+    self.shown.deinit(alloc);
+    if (self.edit_font) |v| _ = c.DeleteObject(v);
+    if (self.list_font) |v| _ = c.DeleteObject(v);
+    if (self.brush) |v| _ = c.DeleteObject(v);
+    alloc.destroy(self);
 }
 
-pub fn toggle(_: *CommandPalette) void {}
+pub fn toggle(self: *CommandPalette) void {
+    if (self.destroying) return;
+    if (self.open) return self.close();
+    self.show() catch |err| {
+        log.warn("error opening command palette err={}", .{err});
+        self.close();
+    };
+}
 
 /// Called when the window moved or changed size.
-pub fn reposition(_: *CommandPalette) void {}
+pub fn reposition(self: *CommandPalette) void {
+    if (!self.open or self.destroying) return;
+    const hwnd = self.hwnd orelse return;
+    if (c.IsIconic(self.window.hwnd) != 0) return;
+
+    if (self.window.getDpi() != self.dpi) self.updateFonts();
+    const rect = self.placement();
+    _ = c.SetWindowPos(
+        hwnd,
+        null,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+    );
+}
+
+/// Whether a command can be run from the palette. The palette lists every
+/// entry of `command-palette-entry`, many of which only exist on another
+/// platform or aren't implemented here.
+pub fn supported(action: input.Binding.Action) bool {
+    return switch (action) {
+        // What the GTK palette leaves out.
+        .close_all_windows,
+        .toggle_secure_input,
+        .check_for_updates,
+        .redo,
+        .undo,
+        .reset_window_size,
+        .toggle_window_float_on_top,
+        => false,
+
+        // Not available on Windows, or not implemented by this runtime.
+        .show_gtk_inspector,
+        .toggle_quick_terminal,
+        .toggle_tab_overview,
+        .show_on_screen_keyboard,
+        .toggle_visibility,
+        .prompt_surface_title,
+        .prompt_tab_title,
+        .prompt_window_title,
+        .toggle_window_decorations,
+        .crash,
+        => false,
+
+        // Anything for another toolkit or platform.
+        else => std.mem.indexOf(u8, @tagName(action), "gtk") == null and
+            std.mem.indexOf(u8, @tagName(action), "macos") == null,
+    };
+}
+
+//---------------------------------------------------------------
+// Opening, closing and running
+
+fn show(self: *CommandPalette) !void {
+    try self.ensureWindow();
+    const hwnd = self.hwnd.?;
+    const edit = self.edit.?;
+
+    self.colors = .init(&self.window.app.config);
+    if (self.brush) |v| _ = c.DeleteObject(v);
+    self.brush = c.CreateSolidBrush(self.colors.bar.ref());
+    self.updateFonts();
+
+    // The field notifies us of the change, which we ignore without items.
+    self.unload();
+    _ = c.SetWindowTextW(edit, c.L(""));
+    try self.load();
+    try self.refilter();
+    self.hover = null;
+    self.pressed = null;
+
+    self.open = true;
+    const rect = self.placement();
+    _ = c.SetWindowPos(
+        hwnd,
+        null,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+    );
+    self.relayoutEdit();
+
+    // Showing a popup activates it. That's only wanted if our window has the
+    // activation, as otherwise we'd steal it from whatever else has it.
+    if (c.GetActiveWindow() == self.window.hwnd) {
+        _ = c.ShowWindow(hwnd, c.SW_SHOW);
+        _ = c.SetFocus(edit);
+    } else {
+        _ = c.ShowWindow(hwnd, c.SW_SHOWNA);
+    }
+}
+
+fn close(self: *CommandPalette) void {
+    if (!self.open or self.closing) return;
+    self.closing = true;
+    defer self.closing = false;
+
+    self.open = false;
+    self.unload();
+    if (self.hwnd) |v| _ = c.ShowWindow(v, c.SW_HIDE);
+    if (!self.destroying) self.window.focusActive();
+}
+
+/// Run the selected command.
+fn run(self: *CommandPalette) void {
+    const loaded = self.loaded orelse return;
+    if (self.selected >= self.shown.items.len) return;
+    const action = loaded.items[self.shown.items[self.selected]].action;
+    const window = self.window;
+
+    // The action points to our items, so they must outlive the call. Taking
+    // them out of `self` lets an action that opens the palette again build
+    // its own. Nothing is destroyed from inside the call, closing is posted,
+    // so `window` is still valid after it.
+    self.loaded = null;
+    defer loaded.arena.deinit();
+    self.close();
+
+    const surface = window.activeSurface() orelse return;
+    _ = surface.core_surface.performBindingAction(action) catch |err|
+        log.warn("error running palette command action={t} err={}", .{ action, err });
+}
+
+fn ensureWindow(self: *CommandPalette) !void {
+    if (self.hwnd != null) return;
+    const hinstance = self.window.app.hinstance;
+
+    self.dpi = self.window.getDpi();
+    const rect = self.placement();
+    const hwnd = c.CreateWindowExW(
+        c.WS_EX_TOOLWINDOW,
+        class_name,
+        c.L("Command Palette"),
+        c.WS_POPUP | c.WS_CLIPCHILDREN,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        self.window.hwnd,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Failed;
+    // Destroying it clears our fields.
+    errdefer _ = c.DestroyWindow(hwnd);
+    _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    self.hwnd = hwnd;
+
+    const round: u32 = c.DWMWCP_ROUND;
+    _ = c.DwmSetWindowAttribute(hwnd, c.DWMWA_WINDOW_CORNER_PREFERENCE, &round, @sizeOf(u32));
+
+    const edit = c.CreateWindowExW(
+        0,
+        c.L("EDIT"),
+        c.L(""),
+        c.WS_CHILD | c.WS_VISIBLE | c.ES_AUTOHSCROLL,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Failed;
+    _ = c.SetWindowLongPtrW(edit, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    const previous = c.SetWindowLongPtrW(edit, c.GWLP_WNDPROC, @bitCast(@intFromPtr(&editWndProc)));
+    if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(previous)));
+    _ = c.SendMessageW(edit, c.EM_SETLIMITTEXT, 256, 0);
+    _ = c.SendMessageW(edit, c.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(c.L("Execute a command..."))));
+    self.edit = edit;
+    self.relayoutEdit();
+}
+
+fn updateFonts(self: *CommandPalette) void {
+    self.dpi = self.window.getDpi();
+    if (self.edit_font) |v| _ = c.DeleteObject(v);
+    if (self.list_font) |v| _ = c.DeleteObject(v);
+    self.edit_font = paint.uiFont(12, self.dpi);
+    self.list_font = paint.uiFont(10, self.dpi);
+    if (self.edit) |v| {
+        _ = c.SendMessageW(v, c.WM_SETFONT, if (self.edit_font) |f| @intFromPtr(f) else 0, 1);
+    }
+}
+
+/// Copy the commands, so they stay valid while we're open.
+fn load(self: *CommandPalette) !void {
+    var arena: ArenaAllocator = .init(self.window.app.core_app.alloc);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    const config = &self.window.app.config;
+    const entries = config.@"command-palette-entry".value.items;
+    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len);
+    for (entries) |entry| {
+        if (!supported(entry.action)) continue;
+        const command = try entry.clone(alloc);
+
+        var action_text: std.Io.Writer.Allocating = .init(alloc);
+        command.action.format(&action_text.writer) catch return error.OutOfMemory;
+
+        var keybind: std.Io.Writer.Allocating = .init(alloc);
+        if (config.keybind.set.getTrigger(command.action)) |trigger| {
+            formatTrigger(&keybind.writer, trigger) catch return error.OutOfMemory;
+        }
+
+        items.appendAssumeCapacity(.{
+            .title = command.title,
+            .description = command.description,
+            .action = command.action,
+            .action_text = action_text.written(),
+            .keybind = keybind.written(),
+        });
+    }
+
+    self.loaded = .{ .arena = arena, .items = items.items };
+}
+
+fn unload(self: *CommandPalette) void {
+    if (self.loaded) |v| v.arena.deinit();
+    self.loaded = null;
+    self.shown.clearRetainingCapacity();
+    self.selected = 0;
+    self.scroll = 0;
+}
+
+/// Where the popup goes, in screen coordinates: centered near the top of the
+/// client area of our window, or as much as fits.
+fn placement(self: *const CommandPalette) c.RECT {
+    const dpi = self.dpi;
+    var client: c.RECT = .{};
+    _ = c.GetClientRect(self.window.hwnd, &client);
+    var origin: c.POINT = .{};
+    _ = c.ClientToScreen(self.window.hwnd, &origin);
+
+    const margin = paint.scale(palette_margin, dpi);
+    const top = @min(paint.scale(palette_top, dpi), @divTrunc(client.bottom, 5));
+    const width = @max(1, @min(paint.scale(palette_width, dpi), client.right - 2 * margin));
+    // Room for the field and a row, even if the window has less.
+    const min_height = paint.scale(input_height + footer_height + row_height, dpi);
+    const height = @max(min_height, @min(
+        paint.scale(palette_max_height, dpi),
+        client.bottom - top - margin,
+    ));
+
+    const left = origin.x + @divTrunc(client.right - width, 2);
+    return .{
+        .left = left,
+        .top = origin.y + top,
+        .right = left + width,
+        .bottom = origin.y + top + height,
+    };
+}
+
+//---------------------------------------------------------------
+// Layout and selection
+
+const Layout = struct {
+    width: c_int,
+    height: c_int,
+    pad: c_int,
+    input_h: c_int,
+    row_h: c_int,
+    /// The list is from here, to the footer's divider.
+    list_top: c_int,
+    list_bottom: c_int,
+
+    fn viewHeight(self: Layout) c_int {
+        return self.list_bottom - self.list_top;
+    }
+};
+
+fn layout(self: *const CommandPalette) Layout {
+    var rect: c.RECT = .{};
+    if (self.hwnd) |v| _ = c.GetClientRect(v, &rect);
+    const input_h = paint.scale(input_height, self.dpi);
+    const list_top = input_h + 1;
+    return .{
+        .width = rect.right,
+        .height = rect.bottom,
+        .pad = paint.scale(padding, self.dpi),
+        .input_h = input_h,
+        .row_h = paint.scale(row_height, self.dpi),
+        .list_top = list_top,
+        .list_bottom = @max(list_top, rect.bottom - paint.scale(footer_height, self.dpi) - 1),
+    };
+}
+
+fn relayoutEdit(self: *CommandPalette) void {
+    const edit = self.edit orelse return;
+    const l = self.layout();
+    const height = paint.scale(edit_height, self.dpi);
+    _ = c.SetWindowPos(
+        edit,
+        null,
+        l.pad,
+        @divTrunc(l.input_h - height, 2),
+        @max(1, l.width - 2 * l.pad),
+        height,
+        c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+    );
+}
+
+fn maxScroll(self: *const CommandPalette, l: Layout) c_int {
+    const content: c_int = @intCast(self.shown.items.len * @as(usize, @intCast(l.row_h)));
+    return @max(0, content - l.viewHeight());
+}
+
+fn setScroll(self: *CommandPalette, value: c_int) void {
+    const l = self.layout();
+    self.scroll = std.math.clamp(value, 0, self.maxScroll(l));
+    self.updateHover();
+    self.invalidate();
+}
+
+fn select(self: *CommandPalette, index: usize) void {
+    if (self.shown.items.len == 0) return;
+    self.selected = @min(index, self.shown.items.len - 1);
+
+    // Keep the row in view.
+    const l = self.layout();
+    const top: c_int = @intCast(self.selected * @as(usize, @intCast(l.row_h)));
+    if (top < self.scroll) {
+        self.scroll = top;
+    } else if (top + l.row_h > self.scroll + l.viewHeight()) {
+        self.scroll = top + l.row_h - l.viewHeight();
+    }
+    self.scroll = std.math.clamp(self.scroll, 0, self.maxScroll(l));
+    self.invalidate();
+}
+
+fn pageSize(self: *const CommandPalette) usize {
+    const l = self.layout();
+    return @intCast(@max(1, @divTrunc(l.viewHeight(), l.row_h) - 1));
+}
+
+fn invalidate(self: *const CommandPalette) void {
+    if (self.hwnd) |v| _ = c.InvalidateRect(v, null, 0);
+}
+
+/// The position in `shown` of the row at the point.
+fn rowAt(self: *const CommandPalette, x: c_int, y: c_int) ?usize {
+    const l = self.layout();
+    if (x < 0 or x >= l.width or y < l.list_top or y >= l.list_bottom) return null;
+    const row: usize = @intCast(@divTrunc(y - l.list_top + self.scroll, l.row_h));
+    return if (row < self.shown.items.len) row else null;
+}
+
+/// Recompute the hovered row from the cursor, after the rows moved.
+fn updateHover(self: *CommandPalette) void {
+    const hwnd = self.hwnd orelse return;
+    var pt: c.POINT = .{};
+    _ = c.GetCursorPos(&pt);
+    _ = c.ScreenToClient(hwnd, &pt);
+    self.hover = self.rowAt(pt.x, pt.y);
+}
+
+fn onWheel(self: *CommandPalette, wparam: c.WPARAM) void {
+    const delta: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+    const l = self.layout();
+    self.setScroll(self.scroll - @divTrunc(@as(c_int, delta) * l.row_h * 3, 240));
+}
+
+fn down(vk: c_int) bool {
+    return c.GetKeyState(vk) < 0;
+}
+
+/// Returns whether the key was ours.
+fn onKey(self: *CommandPalette, vk: usize) bool {
+    const ctrl = down(c.VK_CONTROL);
+    const alt = down(c.VK_MENU);
+    const len = self.shown.items.len;
+    if (self.isToggleKey(vk)) {
+        self.close();
+        return true;
+    }
+    switch (vk) {
+        c.VK_UP => self.select(step(len, self.selected, false)),
+        c.VK_DOWN => self.select(step(len, self.selected, true)),
+        'N', 'P' => {
+            if (!ctrl or alt or down(c.VK_SHIFT)) return false;
+            self.select(step(len, self.selected, vk == 'N'));
+        },
+        c.VK_PRIOR => self.select(self.selected -| self.pageSize()),
+        c.VK_NEXT => self.select(self.selected +| self.pageSize()),
+        c.VK_HOME => {
+            if (!ctrl) return false;
+            self.select(0);
+        },
+        c.VK_END => {
+            if (!ctrl) return false;
+            self.select(len -| 1);
+        },
+        c.VK_RETURN => self.run(),
+        c.VK_ESCAPE => self.close(),
+        else => return false,
+    }
+    return true;
+}
+
+/// Whether this is the key that toggles the palette. The field sees keys
+/// before any binding does, so it has to close us itself. Only letter and
+/// digit triggers are known, which covers the default.
+fn isToggleKey(self: *const CommandPalette, vk: usize) bool {
+    const trigger = self.window.app.config.keybind.set.getTrigger(.toggle_command_palette) orelse return false;
+    const mods = trigger.mods;
+    if (mods.ctrl != down(c.VK_CONTROL) or
+        mods.shift != down(c.VK_SHIFT) or
+        mods.alt != down(c.VK_MENU) or
+        mods.super != (down(c.VK_LWIN) or down(c.VK_RWIN))) return false;
+
+    const ch: u8 = switch (trigger.key) {
+        .unicode => |cp| if (cp < 128) std.ascii.toUpper(@intCast(cp)) else return false,
+        .physical => |key| key: {
+            const tag = @tagName(key);
+            if (std.mem.startsWith(u8, tag, "key_")) break :key std.ascii.toUpper(tag[4]);
+            if (std.mem.startsWith(u8, tag, "digit_")) break :key tag[6];
+            return false;
+        },
+        .catch_all => return false,
+    };
+    return vk == ch;
+}
+
+/// Move a selection by one, wrapping around the ends.
+fn step(len: usize, current: usize, forward: bool) usize {
+    if (len == 0) return 0;
+    if (forward) return if (current + 1 >= len) 0 else current + 1;
+    return if (current == 0) len - 1 else current - 1;
+}
+
+/// Match the field's text again, after it changed.
+fn refilter(self: *CommandPalette) !void {
+    const loaded = self.loaded orelse return;
+    var utf8: [768]u8 = undefined;
+    const text = self.queryText(&utf8);
+    try filter(self.window.app.core_app.alloc, loaded.items, text, &self.shown);
+    self.selected = 0;
+    self.scroll = 0;
+    self.updateHover();
+    self.invalidate();
+}
+
+fn queryText(self: *const CommandPalette, buf: *[768]u8) []const u8 {
+    const edit = self.edit orelse return "";
+    var wide: [256]u16 = undefined;
+    const len: usize = @intCast(@max(0, c.GetWindowTextW(edit, &wide, wide.len)));
+    return buf[0..std.unicode.wtf16LeToWtf8(buf, wide[0..len])];
+}
+
+//---------------------------------------------------------------
+// Painting
+
+fn measure(buf: paint.Buffer, utf8: []const u8, font: ?c.HFONT) c_int {
+    var wide: [128]u16 = undefined;
+    const len = std.unicode.wtf8ToWtf16Le(&wide, utf8[0..@min(utf8.len, 64)]) catch return 0;
+    if (len == 0) return 0;
+    const old = if (font) |v| c.SelectObject(buf.dc, v) else null;
+    defer if (old) |v| {
+        _ = c.SelectObject(buf.dc, v);
+    };
+    var rect: c.RECT = .{};
+    _ = c.DrawTextW(buf.dc, &wide, @intCast(len), &rect, c.DT_CALCRECT | c.DT_SINGLELINE | c.DT_NOPREFIX);
+    return rect.right;
+}
+
+fn onPaint(self: *CommandPalette) void {
+    const hwnd = self.hwnd orelse return;
+    var ps: c.PAINTSTRUCT = .{};
+    const dc = c.BeginPaint(hwnd, &ps) orelse return;
+    defer _ = c.EndPaint(hwnd, &ps);
+
+    const l = self.layout();
+    const buf = paint.Buffer.begin(dc, .{ .right = l.width, .bottom = l.height }) orelse return;
+    defer buf.end();
+    const colors = self.colors;
+    const font = self.list_font;
+
+    buf.fill(.{ .right = l.width, .bottom = l.height }, colors.bar);
+
+    // Rows go first, as the ones scrolled partly out of view are covered by
+    // the field and footer drawn over them.
+    const items: []const Item = if (self.loaded) |v| v.items else &.{};
+    const row_h: usize = @intCast(l.row_h);
+    const first: usize = @intCast(@divTrunc(self.scroll, l.row_h));
+    const last = @min(self.shown.items.len, first + @as(usize, @intCast(@divTrunc(l.viewHeight(), l.row_h))) + 2);
+    const inset = paint.scale(6, self.dpi);
+    // The thumb has a gutter of its own, so it never sits on a row.
+    const gutter = paint.scale(12, self.dpi);
+    const right_edge = l.width - gutter - paint.scale(10, self.dpi);
+    var index = first;
+    while (index < last) : (index += 1) {
+        const item = items[self.shown.items[index]];
+        const top = l.list_top - self.scroll + @as(c_int, @intCast(index * row_h));
+        const row: c.RECT = .{ .left = inset, .top = top, .right = l.width - gutter, .bottom = top + l.row_h };
+        if (index == self.selected) {
+            buf.fill(row, colors.selected);
+        } else if (self.hover == index) {
+            buf.fill(row, colors.hover);
+        }
+
+        var title_right = right_edge;
+        if (item.keybind.len > 0) {
+            const width = measure(buf, item.keybind, font);
+            buf.text(item.keybind, .{
+                .left = right_edge - width,
+                .top = top,
+                .right = right_edge,
+                .bottom = top + l.row_h,
+            }, font, colors.dim, c.DT_RIGHT);
+            title_right -= width + l.pad;
+        }
+        buf.text(item.title, .{
+            .left = l.pad,
+            .top = top,
+            .right = title_right,
+            .bottom = top + l.row_h,
+        }, font, colors.fg, c.DT_LEFT);
+    }
+
+    if (self.shown.items.len == 0) {
+        buf.text("No matching commands", .{
+            .left = 0,
+            .top = l.list_top,
+            .right = l.width,
+            .bottom = l.list_bottom,
+        }, font, colors.dim, c.DT_CENTER);
+    }
+
+    // The thumb of what's scrolled.
+    const max = self.maxScroll(l);
+    if (max > 0) {
+        const view = l.viewHeight();
+        const content = view + max;
+        const thumb = @max(paint.scale(24, self.dpi), @divTrunc(view * view, content));
+        const top = l.list_top + @divTrunc((view - thumb) * self.scroll, max);
+        const width = paint.scale(scrollbar_width, self.dpi);
+        buf.fill(.{
+            .left = l.width - width - paint.scale(4, self.dpi),
+            .top = top,
+            .right = l.width - paint.scale(4, self.dpi),
+            .bottom = top + thumb,
+        }, colors.dim);
+    }
+
+    // The field, with the footer showing what the selection does.
+    buf.fill(.{ .right = l.width, .bottom = l.list_top }, colors.bar);
+    buf.fill(.{ .top = l.input_h, .right = l.width, .bottom = l.list_top }, colors.divider);
+    buf.fill(.{ .top = l.list_bottom, .right = l.width, .bottom = l.height }, colors.bar);
+    buf.fill(.{ .top = l.list_bottom, .right = l.width, .bottom = l.list_bottom + 1 }, colors.divider);
+    if (self.selected < self.shown.items.len) {
+        const item = items[self.shown.items[self.selected]];
+        buf.text(item.description, .{
+            .left = l.pad,
+            .top = l.list_bottom + 1,
+            .right = l.width - l.pad,
+            .bottom = l.height - 1,
+        }, font, colors.dim, c.DT_LEFT);
+    }
+
+    // The border.
+    buf.fill(.{ .right = l.width, .bottom = 1 }, colors.divider);
+    buf.fill(.{ .top = l.height - 1, .right = l.width, .bottom = l.height }, colors.divider);
+    buf.fill(.{ .right = 1, .bottom = l.height }, colors.divider);
+    buf.fill(.{ .left = l.width - 1, .right = l.width, .bottom = l.height }, colors.divider);
+}
+
+//---------------------------------------------------------------
+// Window procedures
+
+fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    const ptr = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
+    if (ptr == 0) return c.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const self: *CommandPalette = @ptrFromInt(@as(usize, @bitCast(ptr)));
+    return self.message(hwnd, msg, wparam, lparam) catch |err| err: {
+        log.warn("error handling palette message msg=0x{x} err={}", .{ msg, err });
+        break :err 0;
+    } orelse c.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// Returns null for default processing.
+fn message(self: *CommandPalette, hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRESULT {
+    const bits: usize = @bitCast(lparam);
+    const x: c_int = @as(i16, @bitCast(@as(u16, @truncate(bits))));
+    const y: c_int = @as(i16, @bitCast(@as(u16, @truncate(bits >> 16))));
+
+    switch (msg) {
+        c.WM_DESTROY => {
+            // The field goes next, and mustn't call back in to us.
+            if (self.edit) |v| _ = c.SetWindowLongPtrW(v, c.GWLP_USERDATA, 0);
+            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, 0);
+            self.hwnd = null;
+            self.edit = null;
+            self.open = false;
+            self.unload();
+        },
+
+        // Losing the activation closes us, like any popup.
+        c.WM_ACTIVATE => if (wparam & 0xFFFF == c.WA_INACTIVE) self.close(),
+
+        c.WM_PAINT => self.onPaint(),
+        c.WM_ERASEBKGND => return 1,
+
+        c.WM_SIZE => {
+            self.relayoutEdit();
+            self.setScroll(self.scroll);
+        },
+
+        c.WM_COMMAND => {
+            const edit = self.edit orelse return null;
+            if (wparam >> 16 == c.EN_CHANGE and lparam == @as(c.LPARAM, @bitCast(@intFromPtr(edit)))) {
+                try self.refilter();
+            }
+        },
+
+        c.WM_CTLCOLOREDIT => {
+            const dc: c.HDC = @ptrFromInt(wparam);
+            _ = c.SetTextColor(dc, self.colors.fg.ref());
+            _ = c.SetBkColor(dc, self.colors.bar.ref());
+            const brush = self.brush orelse return null;
+            return @as(c.LRESULT, @bitCast(@intFromPtr(brush)));
+        },
+
+        c.WM_MOUSEMOVE => {
+            if (!self.tracking_leave) {
+                var track: c.TRACKMOUSEEVENT = .{ .dwFlags = c.TME_LEAVE, .hwndTrack = hwnd };
+                self.tracking_leave = c.TrackMouseEvent(&track) != 0;
+            }
+            const row = self.rowAt(x, y);
+            if (row != self.hover) {
+                self.hover = row;
+                self.invalidate();
+            }
+        },
+        c.WM_MOUSELEAVE => {
+            self.tracking_leave = false;
+            self.hover = null;
+            self.invalidate();
+        },
+        c.WM_LBUTTONDOWN => {
+            if (self.edit) |v| _ = c.SetFocus(v);
+            self.pressed = self.rowAt(x, y);
+            if (self.pressed) |v| self.select(v);
+        },
+        c.WM_LBUTTONUP => {
+            const pressed = self.pressed;
+            self.pressed = null;
+            if (pressed != null and pressed == self.rowAt(x, y)) self.run();
+        },
+        c.WM_MOUSEWHEEL => self.onWheel(wparam),
+
+        else => return null,
+    }
+    return 0;
+}
+
+/// The search field, to give it the keys of a list.
+fn editWndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    const original = edit_proc orelse return c.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const ptr = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
+    if (ptr == 0) return c.CallWindowProcW(original, hwnd, msg, wparam, lparam);
+    const self: *CommandPalette = @ptrFromInt(@as(usize, @bitCast(ptr)));
+
+    switch (msg) {
+        c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
+            if (self.onKey(wparam)) return 0;
+
+            // The message loop only translates keys that belong to an IME,
+            // as the surfaces do it themselves. We have no use for that, so
+            // the field has to be given its characters here.
+            switch (wparam) {
+                c.VK_PROCESSKEY, c.VK_PACKET => {},
+                else => {
+                    const translate: c.MSG = .{
+                        .hwnd = hwnd,
+                        .message = msg,
+                        .wParam = wparam,
+                        .lParam = lparam,
+                        .time = 0,
+                        .pt = .{},
+                    };
+                    _ = c.TranslateMessage(&translate);
+                },
+            }
+        },
+
+        // The keys we act on, and others that the field would show as a box.
+        c.WM_CHAR => switch (wparam) {
+            '\r', '\n', 0x1B, 0x0E, 0x10, 0x7F, '\t' => return 0,
+            else => {},
+        },
+
+        c.WM_MOUSEWHEEL => {
+            self.onWheel(wparam);
+            return 0;
+        },
+
+        else => {},
+    }
+    return c.CallWindowProcW(original, hwnd, msg, wparam, lparam);
+}
+
+//---------------------------------------------------------------
+// Matching
+
+/// Find the items that match the query, best first.
+///
+/// Every word of the query must be in the title, or in the action's name.
+/// Words are matched anywhere, ignoring ASCII case. Titles that start with the
+/// first word come first, then those where every word starts a word of the
+/// title, then the rest. Items of the same kind keep their order, and so does
+/// everything if the query is empty.
+pub fn filter(
+    alloc: Allocator,
+    items: []const Item,
+    query: []const u8,
+    out: *std.ArrayList(u32),
+) Allocator.Error!void {
+    out.clearRetainingCapacity();
+    for (0..3) |wanted| {
+        for (items, 0..) |item, i| {
+            if (rank(item, query) == wanted) try out.append(alloc, @intCast(i));
+        }
+    }
+}
+
+/// Lower is better. Null if the item doesn't match.
+fn rank(item: Item, query: []const u8) ?usize {
+    var words = std.mem.tokenizeAny(u8, query, " \t\r\n");
+    const first = words.peek() orelse return 0;
+
+    var at_word_starts = true;
+    while (words.next()) |word| {
+        const in_title = std.ascii.findIgnoreCase(item.title, word) != null;
+        if (!in_title and std.ascii.findIgnoreCase(item.action_text, word) == null) return null;
+        if (!in_title or !startsWord(item.title, word)) at_word_starts = false;
+    }
+
+    if (std.ascii.startsWithIgnoreCase(item.title, first)) return 0;
+    return if (at_word_starts) 1 else 2;
+}
+
+/// Whether the word is at the start of a word of the text.
+fn startsWord(text: []const u8, word: []const u8) bool {
+    var from: usize = 0;
+    while (std.ascii.findIgnoreCasePos(text, from, word)) |i| {
+        if (i == 0 or !std.ascii.isAlphanumeric(text[i - 1])) return true;
+        from = i + 1;
+    }
+    return false;
+}
+
+/// Write a trigger the way Windows shows shortcuts, such as `Ctrl+Shift+P`.
+pub fn formatTrigger(writer: *std.Io.Writer, trigger: input.Binding.Trigger) std.Io.Writer.Error!void {
+    if (trigger.mods.ctrl) try writer.writeAll("Ctrl+");
+    if (trigger.mods.alt) try writer.writeAll("Alt+");
+    if (trigger.mods.shift) try writer.writeAll("Shift+");
+    if (trigger.mods.super) try writer.writeAll("Win+");
+
+    switch (trigger.key) {
+        .physical => |key| try formatKey(writer, key),
+        .unicode => |cp| if (cp < 128) {
+            try writer.writeByte(std.ascii.toUpper(@intCast(cp)));
+        } else {
+            try writer.print("{u}", .{cp});
+        },
+        .catch_all => try writer.writeAll("Any key"),
+    }
+}
+
+fn formatKey(writer: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
+    const name: ?[]const u8 = switch (key) {
+        .arrow_up => "Up",
+        .arrow_down => "Down",
+        .arrow_left => "Left",
+        .arrow_right => "Right",
+        .escape => "Esc",
+        .page_up => "PgUp",
+        .page_down => "PgDn",
+        .delete => "Del",
+        .insert => "Ins",
+        .backquote => "`",
+        .backslash => "\\",
+        .bracket_left => "[",
+        .bracket_right => "]",
+        .comma => ",",
+        .equal => "=",
+        .minus => "-",
+        .period => ".",
+        .quote => "'",
+        .semicolon => ";",
+        .slash => "/",
+        else => null,
+    };
+    if (name) |v| return writer.writeAll(v);
+
+    // key_a is A and digit_1 is 1.
+    const tag = @tagName(key);
+    if (std.mem.startsWith(u8, tag, "key_")) return writer.writeByte(std.ascii.toUpper(tag[4]));
+    if (std.mem.startsWith(u8, tag, "digit_")) return writer.writeAll(tag["digit_".len..]);
+
+    // The rest read as words: numpad_add is Numpad Add, f5 is F5.
+    var word_start = true;
+    for (tag) |ch| {
+        if (ch == '_') {
+            try writer.writeByte(' ');
+            word_start = true;
+            continue;
+        }
+        try writer.writeByte(if (word_start) std.ascii.toUpper(ch) else ch);
+        word_start = false;
+    }
+}
+
+//---------------------------------------------------------------
+// Tests
+
+fn testItem(title: []const u8, action_text: []const u8) Item {
+    return .{
+        .title = title,
+        .description = "",
+        .action = .new_tab,
+        .action_text = action_text,
+        .keybind = "",
+    };
+}
+
+fn expectFilter(items: []const Item, query: []const u8, expected: []const u32) !void {
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try filter(std.testing.allocator, items, query, &out);
+    try std.testing.expectEqualSlices(u32, expected, out.items);
+}
+
+test "palette: empty query keeps the order" {
+    const items = [_]Item{
+        testItem("Zebra", "a"),
+        testItem("Apple", "b"),
+        testItem("Mango", "c"),
+    };
+    try expectFilter(&items, "", &.{ 0, 1, 2 });
+    try expectFilter(&items, "  \t", &.{ 0, 1, 2 });
+}
+
+test "palette: every word must match" {
+    const items = [_]Item{
+        testItem("Split Right", "new_split:right"),
+        testItem("Split Down", "new_split:down"),
+        testItem("Close Tab", "close_tab:this"),
+    };
+    try expectFilter(&items, "split", &.{ 0, 1 });
+    try expectFilter(&items, "split right", &.{0});
+    try expectFilter(&items, "right split", &.{0});
+    try expectFilter(&items, "  down   SPLIT ", &.{1});
+    try expectFilter(&items, "split tab", &.{});
+    try expectFilter(&items, "nothing", &.{});
+}
+
+test "palette: matching is case insensitive and also uses the action" {
+    const items = [_]Item{
+        testItem("Reload Configuration", "reload_config"),
+        testItem("Open the file", "open_config:new_window"),
+    };
+    try expectFilter(&items, "RELOAD", &.{0});
+    try expectFilter(&items, "config", &.{ 0, 1 });
+    try expectFilter(&items, "open_config", &.{1});
+    try expectFilter(&items, "file config", &.{1});
+}
+
+test "palette: prefix matches come first, then word starts, then the rest" {
+    const items = [_]Item{
+        testItem("Toggle Fullscreen", "toggle_fullscreen"), // inside a word
+        testItem("Scroll to Bottom", "scroll_to_bottom"), // inside a word
+        testItem("Open Tab", "x"), // word start
+        testItem("Tab Overview", "y"), // prefix
+        testItem("Reset Table", "z"), // word start
+        testItem("Tab Bar", "w"), // prefix
+    };
+    try expectFilter(&items, "tab", &.{ 3, 5, 2, 4 });
+    try expectFilter(&items, "ll", &.{ 0, 1 });
+    // Words may be in any order for the word start rank.
+    try expectFilter(&items, "ov tab", &.{3});
+}
+
+test "palette: ranking is stable" {
+    const items = [_]Item{
+        testItem("Beta Go", "a"),
+        testItem("Go Alpha", "b"),
+        testItem("Go Beta", "c"),
+        testItem("Gamma Go", "d"),
+    };
+    try expectFilter(&items, "go", &.{ 1, 2, 0, 3 });
+}
+
+test "palette: step wraps" {
+    try std.testing.expectEqual(@as(usize, 0), step(0, 0, true));
+    try std.testing.expectEqual(@as(usize, 1), step(3, 0, true));
+    try std.testing.expectEqual(@as(usize, 0), step(3, 2, true));
+    try std.testing.expectEqual(@as(usize, 2), step(3, 0, false));
+    try std.testing.expectEqual(@as(usize, 1), step(3, 2, false));
+}
+
+fn expectTrigger(expected: []const u8, trigger: input.Binding.Trigger) !void {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatTrigger(&writer, trigger);
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "palette: format a trigger" {
+    try expectTrigger("Ctrl+Shift+P", .{
+        .key = .{ .physical = .key_p },
+        .mods = .{ .ctrl = true, .shift = true },
+    });
+    try expectTrigger("Ctrl+Alt+Shift+Win+Left", .{
+        .key = .{ .physical = .arrow_left },
+        .mods = .{ .ctrl = true, .alt = true, .shift = true, .super = true },
+    });
+    try expectTrigger("Alt+1", .{
+        .key = .{ .physical = .digit_1 },
+        .mods = .{ .alt = true },
+    });
+    try expectTrigger("Ctrl+PgDn", .{
+        .key = .{ .physical = .page_down },
+        .mods = .{ .ctrl = true },
+    });
+    try expectTrigger("Ctrl+=", .{
+        .key = .{ .physical = .equal },
+        .mods = .{ .ctrl = true },
+    });
+    try expectTrigger("F11", .{ .key = .{ .physical = .f11 } });
+    try expectTrigger("Enter", .{ .key = .{ .physical = .enter } });
+    try expectTrigger("Win+Numpad Add", .{
+        .key = .{ .physical = .numpad_add },
+        .mods = .{ .super = true },
+    });
+    try expectTrigger("Ctrl+Shift+Q", .{
+        .key = .{ .unicode = 'q' },
+        .mods = .{ .ctrl = true, .shift = true },
+    });
+    try expectTrigger("Ctrl+\u{e9}", .{
+        .key = .{ .unicode = 0xe9 },
+        .mods = .{ .ctrl = true },
+    });
+}
+
+test "palette: supported actions" {
+    try std.testing.expect(supported(.new_tab));
+    try std.testing.expect(supported(.{ .new_split = .right }));
+    try std.testing.expect(supported(.toggle_command_palette));
+    try std.testing.expect(!supported(.undo));
+    try std.testing.expect(!supported(.redo));
+    try std.testing.expect(!supported(.show_gtk_inspector));
+    try std.testing.expect(!supported(.toggle_quick_terminal));
+    try std.testing.expect(!supported(.{ .crash = .main }));
+    try std.testing.expect(!supported(.close_all_windows));
+}
