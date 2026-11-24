@@ -34,7 +34,14 @@ const button_size = 13;
 const button_gap = 9;
 const button_margin = 15;
 const close_size = 18;
-const divider_width = 5;
+const divider_width = 8;
+const card_margin = 8;
+const card_radius = 12;
+const outline = 1;
+const outline_focused = 2;
+
+/// Enough for the corners of the terminal to be inside of the rounded ones.
+const card_inset = 5;
 const resize_band = 5;
 
 const animation_timer = 1;
@@ -75,6 +82,18 @@ const Divider = struct {
     area: c.RECT,
 };
 
+/// A pane of a split tab.
+const Card = struct {
+    surface: *const Surface,
+
+    /// What it occupies, along with half of the gaps around it.
+    area: c.RECT,
+    /// The rounded rectangle.
+    card: c.RECT,
+    /// The terminal inside of it.
+    hole: c.RECT,
+};
+
 const Hit = union(enum) {
     none,
     tab: usize,
@@ -95,7 +114,7 @@ const Button = enum { close, minimize, zoom };
 
 const Drag = union(enum) {
     none,
-    tab: struct { start_x: c_int, moving: bool = false },
+    tab: struct { start_x: c_int, start_y: c_int, moving: bool = false },
     divider: usize,
 };
 
@@ -106,6 +125,7 @@ active: usize = 0,
 title_override: ?[:0]const u8 = null,
 
 dividers: std.ArrayList(Divider) = .empty,
+cards: std.ArrayList(Card) = .empty,
 hover: Hit = .none,
 drag: Drag = .none,
 tracking_leave: bool = false,
@@ -212,6 +232,7 @@ fn deinit(self: *Window) void {
     for (self.tabs.items) |*tab| tab.deinit(alloc);
     self.tabs.deinit(alloc);
     self.dividers.deinit(alloc);
+    self.cards.deinit(alloc);
     if (self.title_override) |v| alloc.free(v);
     for ([_]?c.HFONT{ self.font, self.font_bold, self.font_icon }) |font| {
         if (font) |v| _ = c.DeleteObject(v);
@@ -586,6 +607,7 @@ pub fn surfaceFocused(self: *Window, surface: *Surface) void {
     loc.tab.focused = surface;
     syncDimming(loc.tab);
     self.titleChanged(surface);
+    if (self.hasCards()) _ = c.InvalidateRect(self.hwnd, null, 0);
 }
 
 pub fn titleChanged(self: *Window, surface: *const Surface) void {
@@ -669,14 +691,15 @@ fn titleRect(self: *const Window) c.RECT {
     var rect = self.clientRect();
     rect.bottom = if (self.windowed != null) 0 else switch (self.titlebarStyle()) {
         .native, .hidden => 0,
-        .transparent => self.scaled(title_height),
+        // Tabs take the place of the title.
+        .transparent => self.scaled(if (self.barVisible()) strip_height else title_height),
         .tabs => self.scaled(strip_height),
     };
     return rect;
 }
 
 fn tabsInTitle(self: *const Window) bool {
-    return self.titlebarStyle() == .tabs and self.titleRect().bottom > 0;
+    return self.titleRect().bottom > 0;
 }
 
 /// The strip that holds the tabs.
@@ -690,10 +713,7 @@ fn stripRect(self: *const Window) c.RECT {
         rect.left = self.buttonsWidth();
         return rect;
     }
-
-    // The title bar already provides the space above.
-    const overlap: c_int = if (rect.bottom > 0) self.scaled(6) else 0;
-    rect.top = rect.bottom - overlap;
+    rect.top = rect.bottom;
     rect.bottom = rect.top + self.scaled(strip_height);
     return rect;
 }
@@ -760,6 +780,7 @@ pub fn refresh(self: *Window) void {
 
 fn relayout(self: *Window) void {
     self.dividers.clearRetainingCapacity();
+    self.cards.clearRetainingCapacity();
     if (self.minimized) return;
     const tab = self.activeTab() orelse return;
     syncDimming(tab);
@@ -768,43 +789,85 @@ fn relayout(self: *Window) void {
         var it = tab.tree.iterator();
         while (it.next()) |entry| if (entry.handle != zoomed) entry.view.setVisible(false);
         self.layoutNode(tab, zoomed, content);
+    } else if (tab.tree.isSplit()) {
+        self.layoutNode(tab, .root, self.cardsRect(content));
     } else {
         self.layoutNode(tab, .root, content);
     }
     self.repositionOverlays();
 }
 
+/// Whether the panes of the active tab are cards. One that fills the window
+/// isn't.
+fn hasCards(self: *const Window) bool {
+    if (self.tabs.items.len == 0) return false;
+    const tree = &self.tabs.items[self.active].tree;
+    return tree.isSplit() and tree.zoomed == null;
+}
+
+/// The part of the content that's divided between the cards. They keep half of
+/// a gap to the edges of it.
+fn cardsRect(self: *const Window, content: c.RECT) c.RECT {
+    const band = self.scaled(card_margin) - @divTrunc(self.scaled(divider_width), 2);
+    return .{
+        .left = content.left + band,
+        .top = content.top + if (self.barVisible() or self.titleRect().bottom > 0) 0 else band,
+        .right = content.right - band,
+        .bottom = content.bottom - band,
+    };
+}
+
+fn insetRect(rect: c.RECT, by: c_int) c.RECT {
+    return .{
+        .left = rect.left + by,
+        .top = rect.top + by,
+        .right = @max(rect.left + by + 1, rect.right - by),
+        .bottom = @max(rect.top + by + 1, rect.bottom - by),
+    };
+}
+
 fn layoutNode(self: *Window, tab: *Tab, handle: Tree.Node.Handle, area: c.RECT) void {
     switch (tab.tree.nodes[handle.idx()]) {
         .leaf => |surface| {
-            surface.place(area);
+            if (self.hasCards()) {
+                const card = insetRect(area, @divTrunc(self.scaled(divider_width), 2));
+                const hole = insetRect(card, self.scaled(card_inset));
+                self.cards.append(self.app.core_app.alloc, .{
+                    .surface = surface,
+                    .area = area,
+                    .card = card,
+                    .hole = hole,
+                }) catch {};
+                surface.place(hole);
+            } else {
+                surface.place(area);
+            }
             surface.setVisible(true);
         },
 
         .split => |split| {
-            const gap = self.scaled(divider_width);
+            const half = @divTrunc(self.scaled(divider_width), 2);
             const horizontal = split.layout == .horizontal;
             const start, const end = if (horizontal)
                 .{ area.left, area.right }
             else
                 .{ area.top, area.bottom };
-            const space = @max(0, end - start - gap);
             const ratio: f32 = split.ratio;
-            const at = start + @as(c_int, @intFromFloat(ratio * @as(f32, @floatFromInt(space))));
+            const at = start + @as(c_int, @intFromFloat(ratio * @as(f32, @floatFromInt(@max(0, end - start)))));
 
             var first = area;
             var second = area;
             var rect = area;
             if (horizontal) {
                 first.right = at;
-                rect.left = at;
-                rect.right = at + gap;
-                second.left = at + gap;
+                second.left = at;
+                rect.left = at - half;
+                rect.right = at + half;
             } else {
                 first.bottom = at;
-                rect.top = at;
-                rect.bottom = at + gap;
-                second.top = at + gap;
+                second.top = at;
+                rect.top = at - half;
+                rect.bottom = at + half;
             }
             self.dividers.append(self.app.core_app.alloc, .{
                 .rect = rect,
@@ -1115,41 +1178,84 @@ fn onPaint(self: *Window) void {
     defer _ = c.EndPaint(self.hwnd, &ps);
 
     const palette: paint.Palette = .init(&self.app.config);
-    const opacity = self.backgroundOpacity();
-    for (self.dividers.items) |divider| {
-        var buf = paint.Buffer.begin(dc, divider.rect) orelse continue;
-        defer buf.end();
-        buf.base(palette.bg, opacity);
-        const r = divider.rect;
-        var line: paint.Rect = .{
-            .x = 0,
-            .y = 0,
-            .w = @floatFromInt(r.right - r.left),
-            .h = @floatFromInt(r.bottom - r.top),
-        };
-        // A thin line in the middle of a gap that's wide enough to grab.
-        const thickness: f32 = @floatFromInt(@max(1, self.scaled(1)));
-        switch (divider.layout) {
-            .horizontal => {
-                line.x = @floor((line.w - thickness) / 2);
-                line.w = thickness;
-            },
-            .vertical => {
-                line.y = @floor((line.h - thickness) / 2);
-                line.h = thickness;
-            },
-        }
-        buf.round(line, 0, palette.divider, 1);
-    }
+    if (self.hasCards()) self.paintCards(dc, palette);
 
     const bar = self.barRect();
     if (bar.bottom == 0) return;
     var buf = paint.Buffer.begin(dc, bar) orelse return;
     defer buf.end();
-    buf.base(palette.bg, opacity);
+    self.paintBase(&buf, palette);
     if (self.buttonsVisible()) self.paintButtons(buf, palette);
     if (self.barVisible()) self.paintTabs(buf, palette) else self.paintTitle(buf, palette);
-    if (self.barVisible() and !self.tabsInTitle()) self.paintTitle(buf, palette);
+}
+
+/// Cards are on something that's a little further back than they are.
+fn paintBase(self: *const Window, buf: *paint.Buffer, palette: paint.Palette) void {
+    const opacity = self.backgroundOpacity();
+    if (!self.hasCards()) return buf.base(palette.bg, opacity);
+
+    // More of what's behind the window is seen between cards.
+    buf.base(palette.backdrop, if (opacity == 255) 255 else @intCast(@as(u32, opacity) * 7 / 10));
+}
+
+fn paintCards(self: *Window, dc: c.HDC, palette: paint.Palette) void {
+    const content = self.contentRect();
+    const inner = self.cardsRect(content);
+    for ([_]c.RECT{
+        .{ .left = content.left, .top = content.top, .right = content.right, .bottom = inner.top },
+        .{ .left = content.left, .top = inner.bottom, .right = content.right, .bottom = content.bottom },
+        .{ .left = content.left, .top = inner.top, .right = inner.left, .bottom = inner.bottom },
+        .{ .left = inner.right, .top = inner.top, .right = content.right, .bottom = inner.bottom },
+    }) |rect| {
+        var buf = paint.Buffer.begin(dc, rect) orelse continue;
+        self.paintBase(&buf, palette);
+        buf.end();
+    }
+
+    const focused = self.activeSurface();
+    for (self.cards.items) |card| {
+        // Only what's around the terminal, which covers the rest. Filling
+        // all of it would be slow.
+        const a = card.area;
+        const h = card.hole;
+        for ([_]c.RECT{
+            .{ .left = a.left, .top = a.top, .right = a.right, .bottom = h.top },
+            .{ .left = a.left, .top = h.bottom, .right = a.right, .bottom = a.bottom },
+            .{ .left = a.left, .top = h.top, .right = h.left, .bottom = h.bottom },
+            .{ .left = h.right, .top = h.top, .right = a.right, .bottom = h.bottom },
+        }) |rect| {
+            var buf = paint.Buffer.begin(dc, rect) orelse continue;
+            defer buf.end();
+            self.paintBase(&buf, palette);
+            self.paintCard(buf, rect, card.card, palette, card.surface == focused);
+        }
+    }
+}
+
+/// The part of a card that's in a buffer for the given part of the window.
+fn paintCard(
+    self: *const Window,
+    buf: paint.Buffer,
+    part: c.RECT,
+    card: c.RECT,
+    palette: paint.Palette,
+    focused: bool,
+) void {
+    const radius: f32 = @floatFromInt(self.scaled(card_radius));
+    var r: paint.Rect = .from(card);
+    r.x -= @floatFromInt(part.left);
+    r.y -= @floatFromInt(part.top);
+    buf.replaceRound(r, radius, palette.bg, self.backgroundOpacity());
+
+    // The outline is in the gap around the card, and takes nothing of it.
+    const thickness: f32 = @floatFromInt(self.scaled(if (focused) outline_focused else outline));
+    const color = if (!focused)
+        palette.divider
+    else if (self.is_active)
+        palette.accent
+    else
+        palette.accent.mix(palette.backdrop, 128);
+    buf.outline(r.inset(-thickness), radius + thickness, thickness, color);
 }
 
 /// Scales alpha down for windows that aren't active.
@@ -1334,6 +1440,23 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
         .none => {},
         .tab => |*drag| {
             if (!drag.moving and @abs(x - drag.start_x) > self.scaled(6)) drag.moving = true;
+
+            // Tabs leave little of the title bar to take hold of.
+            if (!drag.moving and self.customFrame() and @abs(y - drag.start_y) > self.scaled(8)) {
+                self.drag = .none;
+                _ = c.ReleaseCapture();
+                var point: c.POINT = .{};
+                _ = c.GetCursorPos(&point);
+                const px: u16 = @bitCast(@as(i16, @truncate(point.x)));
+                const py: u16 = @bitCast(@as(i16, @truncate(point.y)));
+                _ = c.PostMessageW(
+                    self.hwnd,
+                    c.WM_NCLBUTTONDOWN,
+                    c.HTCAPTION,
+                    @as(c.LPARAM, py) << 16 | px,
+                );
+                return;
+            }
             if (drag.moving and self.tabs.items.len > 0) {
                 const max = self.tabs.items.len - 1;
                 const offset: f32 = @floatFromInt(@max(0, x - self.pillRect().left));
@@ -1344,14 +1467,13 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
         .divider => |index| if (index < self.dividers.items.len) {
             const divider = self.dividers.items[index];
             const tab = self.activeTab() orelse return;
-            const gap = self.scaled(divider_width);
             const pos, const start, const end = switch (divider.layout) {
                 .horizontal => .{ x, divider.area.left, divider.area.right },
                 .vertical => .{ y, divider.area.top, divider.area.bottom },
             };
-            const space = end - start - gap;
+            const space = end - start;
             if (space <= 0) return;
-            const ratio = @as(f32, @floatFromInt(pos - start - @divTrunc(gap, 2))) /
+            const ratio = @as(f32, @floatFromInt(pos - start)) /
                 @as(f32, @floatFromInt(space));
             tab.tree.resizeInPlace(divider.handle, @floatCast(std.math.clamp(ratio, 0.05, 0.95)));
             self.relayout();
@@ -1399,7 +1521,7 @@ fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
         .none, .caption, .button => {},
         .tab => |i| {
             self.selectTab(i);
-            self.drag = .{ .tab = .{ .start_x = x } };
+            self.drag = .{ .tab = .{ .start_x = x, .start_y = y } };
             _ = c.SetCapture(self.hwnd);
         },
         .tab_close => |i| self.postCloseTab(self.tabs.items[i].id, .this),
@@ -1492,7 +1614,7 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
             const other: ?c.HWND = @ptrFromInt(bits);
             self.is_active = wparam & 0xFFFF != 0 or
                 (other != null and c.GetWindow(other.?, c.GW_OWNER) == self.hwnd);
-            self.invalidateBar();
+            _ = c.InvalidateRect(self.hwnd, null, 0);
             return null;
         },
 

@@ -49,6 +49,10 @@ pub const Palette = struct {
     /// Text of inactive items.
     dim: Rgb,
     divider: Rgb,
+    /// What the cards of splits are on.
+    backdrop: Rgb,
+    /// Marks what has the focus.
+    accent: Rgb,
 
     pub fn init(config: *const Config) Palette {
         const bg: Rgb = .from(config.background);
@@ -60,6 +64,18 @@ pub const Palette = struct {
             .hover = bg.mix(fg, 25),
             .selected = bg.mix(fg, 45),
             .dim = fg.mix(bg, 100),
+            // Darker, unless there's hardly any darker to go.
+            .backdrop = if (!bg.isDark())
+                bg.mix(fg, 22)
+            else if (@max(bg.r, @max(bg.g, bg.b)) < 16)
+                bg.mix(fg, 16)
+            else
+                bg.mix(.{ .r = 0, .g = 0, .b = 0 }, 120),
+            .accent = accent: {
+                // The blue of the theme.
+                const v = config.palette.value[if (bg.isDark()) 12 else 4];
+                break :accent .{ .r = v.r, .g = v.g, .b = v.b };
+            },
             .divider = if (config.@"split-divider-color") |v| .from(v) else bg.mix(fg, 50),
         };
     }
@@ -310,6 +326,42 @@ pub const Buffer = struct {
         for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
             const d = distance(r, limited, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
             self.blend(y * self.width + x, color, alpha * std.math.clamp(0.5 - d, 0, 1));
+        };
+    }
+
+    /// An antialiased rounded rectangle that replaces what's there, rather than
+    /// covering it. What's there may be more or less translucent.
+    pub fn replaceRound(self: Buffer, r: Rect, radius: f32, color: Rgb, opacity: u8) void {
+        if (r.w <= 0 or r.h <= 0) return;
+        const table = premultiplied(opacity);
+        const target = [4]u32{ table[color.b], table[color.g], table[color.r], opacity };
+        const limited = @min(radius, @min(r.w, r.h) / 2);
+        const b = self.bounds(r);
+        for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
+            const d = distance(r, limited, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
+            const t: u32 = @intFromFloat(std.math.clamp(0.5 - d, 0, 1) * 255);
+            if (t == 0) continue;
+            const pixel = &self.pixels[y * self.width + x];
+            var out: u32 = 0;
+            for (target, 0..) |v, i| {
+                const shift: u5 = @intCast(i * 8);
+                const old = (pixel.* >> shift) & 0xFF;
+                out |= ((old * (255 - t) + v * t) / 255) << shift;
+            }
+            pixel.* = out;
+        };
+    }
+
+    /// A solid line along the inside of a rounded rectangle.
+    pub fn outline(self: Buffer, r: Rect, radius: f32, thickness: f32, color: Rgb) void {
+        if (r.w <= 0 or r.h <= 0) return;
+        const limited = @min(radius, @min(r.w, r.h) / 2);
+        const b = self.bounds(r);
+        for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
+            const d = distance(r, limited, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
+            const outer = std.math.clamp(0.5 - d, 0, 1);
+            const inner = std.math.clamp(0.5 - (d + thickness), 0, 1);
+            self.blend(y * self.width + x, color, outer - inner);
         };
     }
 

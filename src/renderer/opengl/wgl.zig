@@ -245,7 +245,14 @@ pub const Dimmer = struct {
         defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
             log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
         try gl.enable(gl.c.GL_BLEND);
-        try gl.blendFunc(gl.c.GL_ONE, gl.c.GL_ONE_MINUS_SRC_ALPHA);
+
+        // This tints what's there, and leaves it as translucent as it was.
+        gl.glad.context.BlendFuncSeparate.?(
+            gl.c.GL_DST_ALPHA,
+            gl.c.GL_ONE_MINUS_SRC_ALPHA,
+            gl.c.GL_ZERO,
+            gl.c.GL_ONE,
+        );
 
         const program = try self.program.use();
         defer program.unbind();
