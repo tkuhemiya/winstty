@@ -18,6 +18,7 @@ const input = @import("../../input.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
 const paint = @import("paint.zig");
+const themes = @import("themes.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -34,9 +35,18 @@ const padding = 16;
 const row_height = 34;
 const footer_height = 28;
 const scrollbar_width = 4;
+const swatch_size = 10;
+
+/// Previews wait for the selection to rest, since each reloads the config.
+const preview_timer = 1;
+const preview_ms = 90;
+
+/// What the list is of.
+const Mode = enum { commands, themes };
 
 /// What a row shows, and what's searched.
 pub const Item = struct {
+    kind: Kind = .action,
     title: []const u8,
     description: []const u8,
     action: input.Binding.Action,
@@ -45,12 +55,34 @@ pub const Item = struct {
     action_text: []const u8,
     /// Empty if the action isn't bound.
     keybind: []const u8,
+
+    /// The file of a theme, and its colors once it has been in view.
+    path: []const u8 = "",
+    swatch: union(enum) { unknown, none, some: themes.Swatch } = .unknown,
+
+    const Kind = enum {
+        action,
+        /// Lists the themes.
+        themes,
+        /// The theme named by the title.
+        theme,
+        /// No theme.
+        default_theme,
+    };
+
+    fn themeName(self: Item) ?[]const u8 {
+        return switch (self.kind) {
+            .action, .themes => null,
+            .theme => self.title,
+            .default_theme => "",
+        };
+    }
 };
 
 /// The items of an open palette, and the memory they point to.
 const Loaded = struct {
     arena: ArenaAllocator,
-    items: []const Item,
+    items: []Item,
 };
 
 /// The original procedure of the EDIT class, which every subclassed field
@@ -77,6 +109,11 @@ open: bool = false,
 closing: bool = false,
 /// Set once our window is going away.
 destroying: bool = false,
+
+mode: Mode = .commands,
+
+/// Whether the theme in use is a preview, to be undone if it isn't chosen.
+previewing: bool = false,
 
 loaded: ?Loaded = null,
 /// Indices of the items matching the query, best first.
@@ -111,6 +148,7 @@ pub fn destroy(self: *CommandPalette) void {
     const alloc = self.window.app.core_app.alloc;
     self.destroying = true;
     self.window.palette = null;
+    if (!self.window.app.quitting) self.endPreview();
     if (self.hwnd) |v| _ = c.DestroyWindow(v);
     self.unload();
     self.shown.deinit(alloc);
@@ -190,18 +228,9 @@ fn show(self: *CommandPalette) !void {
     const hwnd = self.hwnd.?;
     const edit = self.edit.?;
 
-    self.colors = .init(&self.window.app.config);
-    if (self.brush) |v| _ = c.DeleteObject(v);
-    self.brush = c.CreateSolidBrush(self.colors.bar.ref());
+    self.updateColors();
     self.updateFonts();
-
-    // The field notifies us of the change, which we ignore without items.
-    self.unload();
-    _ = c.SetWindowTextW(edit, c.L(""));
-    try self.load();
-    try self.refilter();
-    self.hover = null;
-    self.pressed = null;
+    try self.setMode(.commands);
 
     self.open = true;
     const rect = self.placement();
@@ -226,6 +255,91 @@ fn show(self: *CommandPalette) !void {
     }
 }
 
+fn updateColors(self: *CommandPalette) void {
+    self.colors = .init(&self.window.app.config);
+    if (self.brush) |v| _ = c.DeleteObject(v);
+    self.brush = c.CreateSolidBrush(self.colors.bar.ref());
+    self.invalidate();
+    if (self.edit) |v| _ = c.InvalidateRect(v, null, 1);
+}
+
+/// Start over with a list of something.
+fn setMode(self: *CommandPalette, mode: Mode) !void {
+    const edit = self.edit orelse return;
+
+    // The field notifies us of the change, which we ignore without items.
+    self.unload();
+    _ = c.SetWindowTextW(edit, c.L(""));
+    const hint: [*:0]const u16 = switch (mode) {
+        .commands => c.L("Execute a command..."),
+        .themes => c.L("Choose a theme..."),
+    };
+    _ = c.SendMessageW(edit, c.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(hint)));
+    self.mode = mode;
+    self.hover = null;
+    self.pressed = null;
+    switch (mode) {
+        .commands => {
+            try self.load();
+            try self.refilter();
+        },
+        .themes => {
+            try self.loadThemes();
+            try self.refilter();
+            self.selectCurrentTheme();
+        },
+    }
+}
+
+fn selectCurrentTheme(self: *CommandPalette) void {
+    const loaded = self.loaded orelse return;
+    const theme = self.window.app.config.theme orelse return;
+    const name = switch (self.window.app.core_app.config_conditional_state.theme) {
+        .light => theme.light,
+        .dark => theme.dark,
+    };
+    for (self.shown.items, 0..) |index, i| {
+        if (!std.ascii.eqlIgnoreCase(loaded.items[index].title, name)) continue;
+        self.select(i);
+        break;
+    }
+
+    // It's in use already.
+    self.stopPreviewTimer();
+}
+
+/// Preview the selected theme, soon.
+fn schedulePreview(self: *CommandPalette) void {
+    if (self.mode != .themes or !self.open) return;
+    const hwnd = self.hwnd orelse return;
+    _ = c.SetTimer(hwnd, preview_timer, preview_ms, null);
+}
+
+fn stopPreviewTimer(self: *CommandPalette) void {
+    if (self.hwnd) |v| _ = c.KillTimer(v, preview_timer);
+}
+
+fn preview(self: *CommandPalette) void {
+    self.stopPreviewTimer();
+    if (self.mode != .themes) return;
+    const loaded = self.loaded orelse return;
+    if (self.selected >= self.shown.items.len) return;
+    const name = loaded.items[self.shown.items[self.selected]].themeName() orelse return;
+    self.previewing = true;
+    self.window.app.previewTheme(name) catch |err|
+        log.warn("error previewing theme err={}", .{err});
+    self.updateColors();
+}
+
+/// Go back to the configured theme.
+fn endPreview(self: *CommandPalette) void {
+    self.stopPreviewTimer();
+    if (!self.previewing) return;
+    self.previewing = false;
+    self.window.app.previewTheme(null) catch |err|
+        log.warn("error restoring theme err={}", .{err});
+}
+
 fn close(self: *CommandPalette) void {
     if (!self.open or self.closing) return;
     self.closing = true;
@@ -236,6 +350,7 @@ fn close(self: *CommandPalette) void {
     const active = self.hwnd != null and c.GetActiveWindow() == self.hwnd;
     self.open = false;
     self.unload();
+    self.endPreview();
     if (self.hwnd) |v| _ = c.ShowWindow(v, c.SW_HIDE);
     if (self.destroying) return;
     if (active) _ = c.SetActiveWindow(self.window.hwnd);
@@ -246,7 +361,24 @@ fn close(self: *CommandPalette) void {
 fn run(self: *CommandPalette) void {
     const loaded = self.loaded orelse return;
     if (self.selected >= self.shown.items.len) return;
-    const action = loaded.items[self.shown.items[self.selected]].action;
+    const item = loaded.items[self.shown.items[self.selected]];
+    switch (item.kind) {
+        .action => {},
+        .themes => {
+            self.setMode(.themes) catch |err| log.warn("error listing themes err={}", .{err});
+            return;
+        },
+        .theme, .default_theme => {
+            // It's no longer a preview, so closing won't undo it.
+            self.stopPreviewTimer();
+            self.previewing = false;
+            self.window.app.setTheme(item.themeName().?) catch |err|
+                log.warn("error setting theme err={}", .{err});
+            self.close();
+            return;
+        },
+    }
+    const action = item.action;
     const window = self.window;
 
     // The action points to our items, so they must outlive the call. Taking
@@ -332,7 +464,15 @@ fn load(self: *CommandPalette) !void {
 
     const config = &self.window.app.config;
     const entries = config.@"command-palette-entry".value.items;
-    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len);
+    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len + 1);
+    items.appendAssumeCapacity(.{
+        .kind = .themes,
+        .title = "Change Theme...",
+        .description = "Preview and choose a color theme.",
+        .action = .ignore,
+        .action_text = "theme",
+        .keybind = "",
+    });
     for (entries) |entry| {
         if (!supported(entry.action)) continue;
         const command = try entry.clone(alloc);
@@ -354,6 +494,33 @@ fn load(self: *CommandPalette) !void {
         });
     }
 
+    self.loaded = .{ .arena = arena, .items = items.items };
+}
+
+fn loadThemes(self: *CommandPalette) !void {
+    var arena: ArenaAllocator = .init(self.window.app.core_app.alloc);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    const found = try themes.list(alloc);
+    var items: std.ArrayList(Item) = try .initCapacity(alloc, found.len + 1);
+    items.appendAssumeCapacity(.{
+        .kind = .default_theme,
+        .title = "Default",
+        .description = "The colors of Ghostty itself.",
+        .action = .ignore,
+        .action_text = "",
+        .keybind = "",
+    });
+    for (found) |theme| items.appendAssumeCapacity(.{
+        .kind = .theme,
+        .title = theme.name,
+        .description = "Enter to use this theme, Escape to go back to what you had.",
+        .action = .ignore,
+        .action_text = "",
+        .keybind = "",
+        .path = theme.path,
+    });
     self.loaded = .{ .arena = arena, .items = items.items };
 }
 
@@ -467,6 +634,7 @@ fn select(self: *CommandPalette, index: usize) void {
         self.scroll = top + l.row_h - l.viewHeight();
     }
     self.scroll = std.math.clamp(self.scroll, 0, self.maxScroll(l));
+    self.schedulePreview();
     self.invalidate();
 }
 
@@ -579,6 +747,7 @@ fn refilter(self: *CommandPalette) !void {
     self.selected = 0;
     self.scroll = 0;
     self.updateHover();
+    self.schedulePreview();
     self.invalidate();
 }
 
@@ -621,7 +790,7 @@ fn onPaint(self: *CommandPalette) void {
 
     // Rows go first, as the ones scrolled partly out of view are covered by
     // the field and footer drawn over them.
-    const items: []const Item = if (self.loaded) |v| v.items else &.{};
+    const items: []Item = if (self.loaded) |v| v.items else &.{};
     const row_h: usize = @intCast(l.row_h);
     const first: usize = @intCast(@divTrunc(self.scroll, l.row_h));
     const last = @min(self.shown.items.len, first + @as(usize, @intCast(@divTrunc(l.viewHeight(), l.row_h))) + 2);
@@ -631,7 +800,7 @@ fn onPaint(self: *CommandPalette) void {
     const right_edge = l.width - gutter - paint.scale(10, self.dpi);
     var index = first;
     while (index < last) : (index += 1) {
-        const item = items[self.shown.items[index]];
+        const item = &items[self.shown.items[index]];
         const top = l.list_top - self.scroll + @as(c_int, @intCast(index * row_h));
         const row: c.RECT = .{ .left = inset, .top = top, .right = l.width - gutter, .bottom = top + l.row_h };
         if (index == self.selected) {
@@ -651,6 +820,16 @@ fn onPaint(self: *CommandPalette) void {
             }, font, colors.dim, c.DT_RIGHT);
             title_right -= width + l.pad;
         }
+        if (item.kind == .theme) {
+            if (item.swatch == .unknown) {
+                const read = themes.Swatch.read(self.window.app.core_app.alloc, item.path);
+                item.swatch = if (read) |v| .{ .some = v } else .none;
+            }
+            switch (item.swatch) {
+                .unknown, .none => {},
+                .some => |v| title_right = self.paintSwatch(buf, v, right_edge, top, l) - l.pad,
+            }
+        }
         buf.text(item.title, .{
             .left = l.pad,
             .top = top,
@@ -660,7 +839,10 @@ fn onPaint(self: *CommandPalette) void {
     }
 
     if (self.shown.items.len == 0) {
-        buf.text("No matching commands", .{
+        buf.text(switch (self.mode) {
+            .commands => "No matching commands",
+            .themes => "No matching themes",
+        }, .{
             .left = 0,
             .top = l.list_top,
             .right = l.width,
@@ -706,6 +888,43 @@ fn onPaint(self: *CommandPalette) void {
     buf.fill(.{ .left = l.width - 1, .right = l.width, .bottom = l.height }, colors.divider);
 }
 
+/// The colors of a theme, on its background. Returns the left edge.
+fn paintSwatch(
+    self: *const CommandPalette,
+    buf: paint.Buffer,
+    swatch: themes.Swatch,
+    right: c_int,
+    top: c_int,
+    l: Layout,
+) c_int {
+    const size = paint.scale(swatch_size, self.dpi);
+    const gap = @divTrunc(size, 2);
+    const count: c_int = swatch.colors.len + 1;
+    const width = count * size + (count + 1) * gap;
+    const height = size + gap * 2;
+    const left = right - width;
+    const pill: paint.Rect = .from(.{
+        .left = left,
+        .top = top + @divTrunc(l.row_h - height, 2),
+        .right = right,
+        .bottom = top + @divTrunc(l.row_h - height, 2) + height,
+    });
+    buf.round(pill, pill.h / 2, swatch.background, 1);
+    buf.ring(pill, pill.h / 2, self.colors.fg, 0.22, 0.12);
+    const all = [_]paint.Rgb{swatch.foreground} ++ swatch.colors;
+    for (all, 0..) |color, i| {
+        const x = left + gap + @as(c_int, @intCast(i)) * (size + gap);
+        const dot: paint.Rect = .from(.{
+            .left = x,
+            .top = @as(c_int, @intFromFloat(pill.y)) + gap,
+            .right = x + size,
+            .bottom = @as(c_int, @intFromFloat(pill.y)) + gap + size,
+        });
+        buf.round(dot, dot.w / 2, color, 1);
+    }
+    return left;
+}
+
 //---------------------------------------------------------------
 // Window procedures
 
@@ -740,6 +959,7 @@ fn message(self: *CommandPalette, hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lpar
         c.WM_ACTIVATE => if (wparam & 0xFFFF == c.WA_INACTIVE) self.close(),
 
         c.WM_PAINT => self.onPaint(),
+        c.WM_TIMER => if (wparam == preview_timer) self.preview(),
         c.WM_ERASEBKGND => return 1,
 
         c.WM_SIZE => {

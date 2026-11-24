@@ -58,3 +58,6 @@ src/font/nerd_font_attributes.zig linguist-generated=true
 src/font/nerd_font_codepoint_tables.py linguist-generated=true
 src/font/res/** linguist-vendored
 src/terminal/res/** linguist-vendored
+
+# Themes have all kinds of names, and no extension.
+vendor/themes/** -text

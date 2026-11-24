@@ -14,6 +14,7 @@ const CommandPalette = @import("CommandPalette.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
+const themes = @import("themes.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -370,8 +371,27 @@ fn reloadConfig(self: *App, soft: bool) !void {
         self.config.deinit();
         self.config = config;
     }
+    try self.applyConfig();
+}
+
+fn applyConfig(self: *App) !void {
     try self.core_app.updateConfig(self, &self.config);
     for (self.windows.items) |window| window.configChanged();
+}
+
+/// Show a theme without saving it, or go back to the configured one.
+pub fn previewTheme(self: *App, name: ?[]const u8) !void {
+    const alloc = self.core_app.alloc;
+    const config = if (name) |v| try themes.loadConfig(alloc, v) else try Config.load(alloc);
+    self.config.deinit();
+    self.config = config;
+    try self.applyConfig();
+}
+
+/// Save a theme to the configuration, and use it. An empty name is none.
+pub fn setTheme(self: *App, name: []const u8) !void {
+    try themes.save(self.core_app.alloc, name);
+    try self.previewTheme(null);
 }
 
 fn openConfig(self: *App) !bool {

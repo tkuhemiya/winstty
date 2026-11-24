@@ -107,7 +107,16 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     }
 
     // Themes
-    if (cfg.emit_themes) {
+    if (cfg.emit_themes and cfg.target.result.os.tag == .windows) {
+        // The package has names that aren't valid on Windows, so it can't be
+        // unpacked there. This is the same with those renamed.
+        const install_step = b.addInstallDirectory(.{
+            .source_dir = b.path("vendor/themes"),
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = b.pathJoin(&.{ "ghostty", "themes" }),
+        });
+        try steps.append(b.allocator, &install_step.step);
+    } else if (cfg.emit_themes) {
         if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
             const install_step = b.addInstallDirectory(.{
                 .source_dir = upstream.path(""),
