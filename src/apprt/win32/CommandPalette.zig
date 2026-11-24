@@ -42,7 +42,7 @@ const preview_timer = 1;
 const preview_ms = 90;
 
 /// What the list is of.
-const Mode = enum { commands, themes };
+const Mode = enum { commands, themes, shells };
 
 /// What a row shows, and what's searched.
 pub const Item = struct {
@@ -68,11 +68,15 @@ pub const Item = struct {
         theme,
         /// No theme.
         default_theme,
+        /// Lists the shells.
+        shells,
+        /// A new tab running the command in `path`.
+        shell,
     };
 
     fn themeName(self: Item) ?[]const u8 {
         return switch (self.kind) {
-            .action, .themes => null,
+            .action, .themes, .shells, .shell => null,
             .theme => self.title,
             .default_theme => "",
         };
@@ -273,6 +277,7 @@ fn setMode(self: *CommandPalette, mode: Mode) !void {
     const hint: [*:0]const u16 = switch (mode) {
         .commands => c.L("Execute a command..."),
         .themes => c.L("Choose a theme..."),
+        .shells => c.L("Choose a shell..."),
     };
     _ = c.SendMessageW(edit, c.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(hint)));
     self.mode = mode;
@@ -287,6 +292,10 @@ fn setMode(self: *CommandPalette, mode: Mode) !void {
             try self.loadThemes();
             try self.refilter();
             self.selectCurrentTheme();
+        },
+        .shells => {
+            try self.loadShells();
+            try self.refilter();
         },
     }
 }
@@ -366,6 +375,29 @@ fn run(self: *CommandPalette) void {
         .action => {},
         .themes => {
             self.setMode(.themes) catch |err| log.warn("error listing themes err={}", .{err});
+            return;
+        },
+        .shells => {
+            self.setMode(.shells) catch |err| log.warn("error listing shells err={}", .{err});
+            return;
+        },
+        .shell => {
+            const window = self.window;
+            const command = alloc_dup: {
+                const gpa = window.app.core_app.alloc;
+                break :alloc_dup gpa.dupe(u8, item.path) catch return;
+            };
+            defer window.app.core_app.alloc.free(command);
+            window.app.setShell(command) catch |err|
+                log.warn("error remembering shell err={}", .{err});
+            self.close();
+            if (window.activeSurface()) |surface| {
+                window.replaceSurface(surface, command) catch |err|
+                    log.warn("error changing shell command={s} err={}", .{ command, err });
+            } else {
+                _ = window.newTabWith(.tab, command) catch |err|
+                    log.warn("error opening shell command={s} err={}", .{ command, err });
+            }
             return;
         },
         .theme, .default_theme => {
@@ -464,7 +496,15 @@ fn load(self: *CommandPalette) !void {
 
     const config = &self.window.app.config;
     const entries = config.@"command-palette-entry".value.items;
-    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len + 1);
+    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len + 2);
+    items.appendAssumeCapacity(.{
+        .kind = .shells,
+        .title = "Change Shell...",
+        .description = "Switch this pane, and new ones, to PowerShell, cmd, WSL or another shell.",
+        .action = .ignore,
+        .action_text = "shell",
+        .keybind = "",
+    });
     items.appendAssumeCapacity(.{
         .kind = .themes,
         .title = "Change Theme...",
@@ -492,6 +532,94 @@ fn load(self: *CommandPalette) !void {
             .action_text = action_text.written(),
             .keybind = keybind.written(),
         });
+    }
+
+    self.loaded = .{ .arena = arena, .items = items.items };
+}
+
+fn addShell(
+    alloc: std.mem.Allocator,
+    items: *std.ArrayList(Item),
+    title: []const u8,
+    description: []const u8,
+    command: []const u8,
+) !void {
+    try items.append(alloc, .{
+        .kind = .shell,
+        .title = title,
+        .description = description,
+        .action = .ignore,
+        .action_text = "",
+        .keybind = "",
+        .path = command,
+    });
+}
+
+/// The shells we can offer: the usual Windows ones, Git Bash if it's there,
+/// and every WSL distribution, which we read from the registry rather than
+/// starting `wsl.exe`.
+fn loadShells(self: *CommandPalette) !void {
+    var arena: ArenaAllocator = .init(self.window.app.core_app.alloc);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var items: std.ArrayList(Item) = .empty;
+    const desc = "Enter to use it here and in new tabs and splits.";
+    try addShell(alloc, &items, "PowerShell 7", desc, "pwsh.exe -NoLogo");
+    try addShell(alloc, &items, "Windows PowerShell", desc, "powershell.exe -NoLogo");
+    try addShell(alloc, &items, "Command Prompt", desc, "cmd.exe");
+
+    const git_bash = "C:\\Program Files\\Git\\bin\\bash.exe";
+    if (c.GetFileAttributesW(c.L(git_bash)) != 0xFFFFFFFF) {
+        try addShell(alloc, &items, "Git Bash", desc, "\"" ++ git_bash ++ "\" --login -i");
+    }
+
+    try addShell(alloc, &items, "WSL", "The default WSL distribution.", "wsl.exe");
+
+    const lxss = c.L("Software\\Microsoft\\Windows\\CurrentVersion\\Lxss");
+    var root: ?*anyopaque = null;
+    if (c.RegOpenKeyExW(c.HKEY_CURRENT_USER, lxss, 0, c.KEY_READ, &root) == 0) {
+        defer _ = c.RegCloseKey(root.?);
+        var index: u32 = 0;
+        while (index < 64) : (index += 1) {
+            var guid: [128:0]u16 = undefined;
+            var guid_len: u32 = guid.len;
+            if (c.RegEnumKeyExW(root.?, index, &guid, &guid_len, null, null, null, null) != 0) break;
+            guid[guid_len] = 0;
+
+            var path: [320:0]u16 = undefined;
+            var n: usize = 0;
+            for (lxss) |ch| {
+                path[n] = ch;
+                n += 1;
+            }
+            path[n] = '\\';
+            n += 1;
+            for (guid[0..guid_len]) |ch| {
+                path[n] = ch;
+                n += 1;
+            }
+            path[n] = 0;
+
+            var name: [256:0]u16 = undefined;
+            var size: u32 = @sizeOf(@TypeOf(name)) - 2;
+            if (c.RegGetValueW(
+                c.HKEY_CURRENT_USER,
+                &path,
+                c.L("DistributionName"),
+                c.RRF_RT_REG_SZ,
+                null,
+                &name,
+                &size,
+            ) != 0) continue;
+            const name16 = std.mem.sliceTo(&name, 0);
+            const name8 = std.unicode.utf16LeToUtf8Alloc(alloc, name16) catch continue;
+            // Docker's own distributions aren't for logging into.
+            if (std.mem.startsWith(u8, name8, "docker-desktop")) continue;
+            const title = try std.fmt.allocPrint(alloc, "WSL: {s}", .{name8});
+            const command = try std.fmt.allocPrint(alloc, "wsl.exe -d {s}", .{name8});
+            try addShell(alloc, &items, title, "A WSL distribution.", command);
+        }
     }
 
     self.loaded = .{ .arena = arena, .items = items.items };
@@ -842,6 +970,7 @@ fn onPaint(self: *CommandPalette) void {
         buf.text(switch (self.mode) {
             .commands => "No matching commands",
             .themes => "No matching themes",
+            .shells => "No matching shells",
         }, .{
             .left = 0,
             .top = l.list_top,

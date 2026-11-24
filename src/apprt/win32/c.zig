@@ -195,6 +195,8 @@ pub const MONITOR_DEFAULTTONEAREST = 2;
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 pub const HKEY_CURRENT_USER: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2147483647))));
 pub const RRF_RT_REG_DWORD = 0x10;
+pub const RRF_RT_REG_SZ = 0x2;
+pub const KEY_READ = 0x20019;
 
 pub extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?HANDLE;
@@ -205,6 +207,10 @@ pub extern "kernel32" fn GlobalSize(HANDLE) callconv(.winapi) usize;
 pub extern "kernel32" fn SetConsoleCtrlHandler(?*const anyopaque, BOOL) callconv(.winapi) BOOL;
 pub extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
 pub extern "advapi32" fn RegGetValueW(*anyopaque, [*:0]const u16, [*:0]const u16, u32, ?*u32, ?*anyopaque, ?*u32) callconv(.winapi) c_long;
+pub extern "advapi32" fn RegOpenKeyExW(*anyopaque, [*:0]const u16, u32, u32, *?*anyopaque) callconv(.winapi) c_long;
+pub extern "advapi32" fn RegEnumKeyExW(*anyopaque, u32, [*]u16, *u32, ?*u32, ?[*]u16, ?*u32, ?*anyopaque) callconv(.winapi) c_long;
+pub extern "advapi32" fn RegCloseKey(*anyopaque) callconv(.winapi) c_long;
+pub extern "kernel32" fn GetFileAttributesW([*:0]const u16) callconv(.winapi) u32;
 
 pub extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) u16;
 pub extern "user32" fn CreateWindowExW(u32, [*:0]const u16, [*:0]const u16, u32, c_int, c_int, c_int, c_int, ?HWND, ?*anyopaque, ?HINSTANCE, ?*anyopaque) callconv(.winapi) ?HWND;

@@ -68,6 +68,7 @@ pub fn create(
     window: *Window,
     context: apprt.surface.NewSurfaceContext,
     rect: c.RECT,
+    command: ?[]const u8,
 ) !*Surface {
     const app = window.app;
     const alloc = app.core_app.alloc;
@@ -110,6 +111,10 @@ pub fn create(
 
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
+    if (command orelse app.shell_override) |cmd| {
+        const arena = config._arena.?.allocator();
+        config.command = .{ .shell = try arena.dupeSentinel(u8, cmd, 0) };
+    }
     if (window.force_opaque) config.@"background-opacity" = 1;
     if (app.config.@"window-inherit-font-size") {
         if (parent) |v| config.@"font-size" = v.core_surface.font_size.points;

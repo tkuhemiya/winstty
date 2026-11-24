@@ -264,10 +264,15 @@ fn locate(self: *Window, surface: *const Surface) ?Location {
 }
 
 pub fn newTab(self: *Window, context: apprt.surface.NewSurfaceContext) !*Surface {
+    return self.newTabWith(context, null);
+}
+
+/// A new tab running `command` instead of the configured one, if given.
+pub fn newTabWith(self: *Window, context: apprt.surface.NewSurfaceContext, command: ?[]const u8) !*Surface {
     const alloc = self.app.core_app.alloc;
     try self.tabs.ensureUnusedCapacity(alloc, 1);
 
-    const surface = try Surface.create(self, context, self.contentRect());
+    const surface = try Surface.create(self, context, self.contentRect(), command);
     const tree = Tree.init(alloc, surface) catch |err| {
         surface.destroy();
         return err;
@@ -493,6 +498,36 @@ fn setTree(tab: *Tab, tree: Tree) void {
     old.deinit();
 }
 
+/// Run `command` in place of `old`, in the same spot of the layout. The old
+/// process ends. Must not be called within a callback of `old`.
+pub fn replaceSurface(self: *Window, old: *Surface, command: []const u8) !void {
+    const alloc = self.app.core_app.alloc;
+    const first = self.locate(old) orelse return;
+
+    const surface = try Surface.create(self, .split, self.contentRect(), command);
+    var insert = Tree.init(alloc, surface) catch |err| {
+        surface.destroy();
+        return err;
+    };
+    defer insert.deinit();
+
+    // Put the new surface beside the old one, then take the old one out.
+    setTree(first.tab, try first.tab.tree.split(alloc, first.handle, .right, 0.5, &insert));
+    first.tab.focused = surface;
+
+    const loc = self.locate(old) orelse return;
+    const tree = try loc.tab.tree.remove(alloc, loc.handle);
+    old.setVisible(false);
+    var old_tree = loc.tab.tree;
+    loc.tab.tree = tree;
+    loc.tab.focused = surface;
+    self.refresh();
+    if (loc.index == self.active) self.focusActive();
+
+    // This drops the last reference to the old surface.
+    old_tree.deinit();
+}
+
 pub fn newSplit(
     self: *Window,
     from: *Surface,
@@ -501,7 +536,7 @@ pub fn newSplit(
     const alloc = self.app.core_app.alloc;
     if (self.locate(from) == null) return false;
 
-    const surface = try Surface.create(self, .split, self.contentRect());
+    const surface = try Surface.create(self, .split, self.contentRect(), null);
     var insert = Tree.init(alloc, surface) catch |err| {
         surface.destroy();
         return err;

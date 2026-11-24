@@ -37,6 +37,10 @@ hinstance: c.HINSTANCE,
 hwnd: c.HWND,
 
 windows: std.ArrayList(*Window) = .empty,
+
+/// A shell chosen from the command palette. New tabs and splits run it instead
+/// of the configured `command`, until we exit.
+shell_override: ?[]u8 = null,
 last_tab_id: u32 = 0,
 
 /// The number of open message boxes. They pump messages, and may have been
@@ -140,9 +144,17 @@ pub fn run(self: *App) !void {
 
 pub fn terminate(self: *App) void {
     self.closeAll();
+    if (self.shell_override) |v| self.core_app.alloc.free(v);
     _ = c.DestroyWindow(self.hwnd);
     self.windows.deinit(self.core_app.alloc);
     self.config.deinit();
+}
+
+/// Make `command` the shell of every surface created from now on.
+pub fn setShell(self: *App, command: []const u8) !void {
+    const copy = try self.core_app.alloc.dupe(u8, command);
+    if (self.shell_override) |v| self.core_app.alloc.free(v);
+    self.shell_override = copy;
 }
 
 /// Called by CoreApp, from any thread, to wake up the event loop.
