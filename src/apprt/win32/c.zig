@@ -428,7 +428,6 @@ pub extern "gdi32" fn SetBkColor(HDC, COLORREF) callconv(.winapi) COLORREF;
 //---------------------------------------------------------------
 // Command palette
 
-
 pub const EM_SETLIMITTEXT = 0x00C5;
 pub const EM_SETCUEBANNER = 0x1501;
 pub const WA_INACTIVE = 0;
@@ -437,3 +436,13 @@ pub const DT_LEFT = 0x0;
 pub const DT_CALCRECT = 0x400;
 
 pub const DWMWCP_ROUND: u32 = 2;
+
+//---------------------------------------------------------------
+// Inspector
+
+pub const VK_F4 = 0x73;
+pub const GL_COLOR_BUFFER_BIT = 0x4000;
+
+pub extern "opengl32" fn glViewport(c_int, c_int, c_int, c_int) callconv(.winapi) void;
+pub extern "opengl32" fn glClearColor(f32, f32, f32, f32) callconv(.winapi) void;
+pub extern "opengl32" fn glClear(u32) callconv(.winapi) void;
