@@ -392,3 +392,35 @@ pub extern "gdi32" fn SetTextColor(HDC, COLORREF) callconv(.winapi) COLORREF;
 pub extern "gdi32" fn CreateFontW(c_int, c_int, c_int, c_int, c_int, u32, u32, u32, u32, u32, u32, u32, u32, [*:0]const u16) callconv(.winapi) ?HFONT;
 pub extern "gdi32" fn CreateRectRgn(c_int, c_int, c_int, c_int) callconv(.winapi) ?HGDIOBJ;
 pub extern "dwmapi" fn DwmEnableBlurBehindWindow(HWND, *const DWM_BLURBEHIND) callconv(.winapi) c_long;
+
+//---------------------------------------------------------------
+// Search bar
+
+pub const GWLP_WNDPROC = -4;
+pub const GWLP_HWNDPARENT = -8;
+pub const WM_SETFONT = 0x0030;
+pub const WM_MOUSEACTIVATE = 0x0021;
+pub const WM_NCDESTROY = 0x0082;
+pub const WM_TIMER = 0x0113;
+pub const WM_CTLCOLOREDIT = 0x0133;
+pub const MA_ACTIVATE = 1;
+pub const MA_NOACTIVATE = 3;
+pub const EM_GETSEL = 0x00B0;
+pub const EM_SETSEL = 0x00B1;
+pub const EM_REPLACESEL = 0x00C2;
+pub const EN_CHANGE = 0x0300;
+pub const ES_AUTOHSCROLL = 0x80;
+pub const VK_BACK = 0x08;
+pub const VK_RETURN = 0x0D;
+pub const VK_ESCAPE = 0x1B;
+pub const DT_RIGHT = 0x2;
+pub const DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+pub const DWMWCP_ROUNDSMALL: u32 = 3;
+
+pub extern "user32" fn SetTimer(?HWND, usize, u32, ?*const anyopaque) callconv(.winapi) usize;
+pub extern "user32" fn KillTimer(?HWND, usize) callconv(.winapi) BOOL;
+pub extern "user32" fn CallWindowProcW(WNDPROC, HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+pub extern "user32" fn SetActiveWindow(HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
+pub extern "user32" fn GetWindowTextLengthW(HWND) callconv(.winapi) c_int;
+pub extern "gdi32" fn SetBkColor(HDC, COLORREF) callconv(.winapi) COLORREF;
