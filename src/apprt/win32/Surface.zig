@@ -15,6 +15,7 @@ const Scrollbar = @import("Scrollbar.zig");
 const termio = @import("../../termio.zig");
 const SearchBar = @import("SearchBar.zig");
 const Session = @import("Session.zig");
+const Ticker = @import("Ticker.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
 const paint = @import("paint.zig");
@@ -69,6 +70,9 @@ moving: std.atomic.Value(bool) = .init(false),
 moves: std.atomic.Value(u32) = .init(0),
 presented: std.atomic.Value(u32) = .init(0),
 
+/// When the size last followed the area while it was moving.
+last_resize: i64 = 0,
+
 /// The part of the window that's shown, if it's not all of it.
 clip: ?c.SIZE = null,
 
@@ -94,6 +98,9 @@ dead_key: bool = false,
 
 /// High half of a surrogate pair delivered by WM_CHAR.
 high_surrogate: u16 = 0,
+
+/// At least this long between sizes while moving.
+const resize_ms = 30;
 
 /// How a surface fits its area while that moves.
 pub const Fit = struct {
@@ -528,6 +535,12 @@ fn setClip(self: *Surface, clip: ?c.SIZE) void {
     }
 }
 
+/// Show nothing, without being hidden.
+pub fn cutOff(self: *Surface) void {
+    self.setClip(.{ .cx = 0, .cy = 0 });
+    if (self.scrollbar) |v| _ = c.ShowWindow(v.hwnd, c.SW_HIDE);
+}
+
 fn sizeChanged(self: *Surface) !void {
     if (!self.ready or self.fit.frozen) return;
     var size: apprt.SurfaceSize = .{
@@ -537,6 +550,19 @@ fn sizeChanged(self: *Surface) !void {
     if (size.width == 0 or size.height == 0) return;
     size.width = @max(size.width, @as(u32, @intCast(@max(0, self.fit.min_width - self.scrollbarWidth()))));
     size.height = @max(size.height, @as(u32, @intCast(@max(0, self.fit.min_height))));
+
+    // A size takes a while to be drawn at, so don't have every one of them
+    // while moving, and only those that make a difference to the text.
+    if (self.fit.moving) {
+        const cell = self.core_surface.size.cell;
+        const old = self.core_surface.size.screen;
+        if (cell.width > 0 and cell.height > 0 and
+            old.width / cell.width == size.width / cell.width and
+            old.height / cell.height == size.height / cell.height) return;
+        const now = Ticker.now();
+        if (Ticker.milliseconds(self.last_resize, now) < resize_ms) return;
+        self.last_resize = now;
+    }
     try self.core_surface.sizeCallback(size);
 }
 

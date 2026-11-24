@@ -79,7 +79,7 @@ const moving_min_height = 80;
 const prepare_ms = 120;
 
 /// At most this long in each frame, for the frames of panes.
-const await_ms = 10;
+const await_ms = 5;
 
 /// Retries destroying surfaces while a message box is open.
 const bury_timer = 1;
@@ -1695,9 +1695,9 @@ fn arrange(self: *Window) void {
     if (self.minimized) return;
     const tab = self.activeTab() orelse return;
     syncDimming(tab);
-    const inner = self.cardsRect(self.contentRect());
+    const content = self.contentRect();
     self.layout.arrange(
-        inner,
+        self.cardsRect(content),
         &self.placements,
         &self.boundaries,
     ) catch |err| {
@@ -1753,8 +1753,10 @@ fn arrange(self: *Window) void {
             const height = target.bottom - target.top;
             break :fit .{
                 .moving = true,
-                .max_width = inner.right - inner.left,
-                .max_height = inner.bottom - inner.top,
+                // Of all there is, since what's divided grows as well when
+                // panes stop being cards.
+                .max_width = content.right - content.left,
+                .max_height = content.bottom - content.top,
                 .target_width = width,
                 .target_height = height,
                 // What appears is uncovered, as it already has its size.
@@ -1763,7 +1765,9 @@ fn arrange(self: *Window) void {
             };
         };
         if (shown or !v.vanishing) surface.place(hole, fit);
-        surface.setVisible(shown);
+
+        // Hiding waits for what's being drawn, so that's for when it's at rest.
+        if (!shown and is_moving and surface.visible) surface.cutOff() else surface.setVisible(shown);
     }
     self.repositionOverlays();
 }
