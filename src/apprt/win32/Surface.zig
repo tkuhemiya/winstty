@@ -1,4 +1,4 @@
-//! A terminal surface. Each surface is its own top-level window.
+//! A terminal surface: a child window of a Window, rendered to by OpenGL.
 const Surface = @This();
 
 const std = @import("std");
@@ -10,6 +10,9 @@ const renderer = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
 const CoreSurface = @import("../../Surface.zig");
 const App = @import("App.zig");
+const InspectorWindow = @import("InspectorWindow.zig");
+const SearchBar = @import("SearchBar.zig");
+const Window = @import("Window.zig");
 const c = @import("c.zig");
 
 const log = std.log.scoped(.win32);
@@ -18,31 +21,32 @@ const log = std.log.scoped(.win32);
 const WM_CLOSE_SURFACE = c.WM_APP + 1;
 
 app: *App,
+window: *Window,
 hwnd: c.HWND,
+
+/// The number of split trees holding this surface.
+refs: usize = 0,
 core_surface: CoreSurface = undefined,
 
 /// False until the core surface is initialized.
 ready: bool = false,
 
 title: ?[:0]const u8 = null,
-size_limit: apprt.action.SizeLimit = .{
-    .min_width = 0,
-    .min_height = 0,
-    .max_width = 0,
-    .max_height = 0,
-},
+
+/// Whether we're shown: in the selected tab, and not hidden by a zoomed split.
+visible: bool = false,
+
+search: ?*SearchBar = null,
+inspector: ?*InspectorWindow = null,
+scrollbar: terminal.Scrollbar = .zero,
+scrollbar_shown: bool = false,
 
 cursor: ?c.HCURSOR,
 cursor_visible: bool = true,
 tracking_leave: bool = false,
 buttons_down: u8 = 0,
 
-/// Placement to restore when leaving fullscreen. Non-null in fullscreen.
-windowed: ?struct { placement: c.WINDOWPLACEMENT, style: isize } = null,
-
-/// Non-zero while a message box is open. It pumps messages from inside a core
-/// callback, so the surface must not be destroyed until it returns.
-modal: u32 = 0,
+/// A close was requested while a message box was open.
 close_pending: bool = false,
 
 /// True if a dead key is waiting for its base character.
@@ -51,24 +55,33 @@ dead_key: bool = false,
 /// High half of a surrogate pair delivered by WM_CHAR.
 high_surrogate: u16 = 0,
 
-pub fn create(app: *App, context: apprt.surface.NewSurfaceContext) !*Surface {
+/// Create a hidden surface. It's destroyed when no longer in any split tree.
+pub fn create(
+    window: *Window,
+    context: apprt.surface.NewSurfaceContext,
+    rect: c.RECT,
+) !*Surface {
+    const app = window.app;
     const alloc = app.core_app.alloc;
+    const parent = window.activeSurface() orelse parent: {
+        const core_surface = app.core_app.focusedSurface() orelse break :parent null;
+        break :parent core_surface.rt_surface;
+    };
 
     const self = try alloc.create(Surface);
     errdefer alloc.destroy(self);
 
-    // Sized in 96 DPI units until we know which monitor we landed on.
-    const dpi: c_int = @intCast(c.GetDpiForSystem());
+    const scrollbar = app.config.scrollbar == .system;
     const hwnd = c.CreateWindowExW(
         0,
-        App.window_class,
-        c.L("Ghostty"),
-        c.WS_OVERLAPPEDWINDOW,
-        c.CW_USEDEFAULT,
-        c.CW_USEDEFAULT,
-        @divTrunc(960 * dpi, 96),
-        @divTrunc(600 * dpi, 96),
-        null,
+        App.surface_class,
+        c.L(""),
+        c.WS_CHILD | c.WS_CLIPSIBLINGS | if (scrollbar) c.WS_VSCROLL else 0,
+        rect.left,
+        rect.top,
+        @max(1, rect.right - rect.left),
+        @max(1, rect.bottom - rect.top),
+        window.hwnd,
         null,
         app.hinstance,
         null,
@@ -77,13 +90,18 @@ pub fn create(app: *App, context: apprt.surface.NewSurfaceContext) !*Surface {
 
     self.* = .{
         .app = app,
+        .window = window,
         .hwnd = hwnd,
         .cursor = c.LoadCursorW(null, c.IDC_IBEAM),
+        .scrollbar_shown = scrollbar,
     };
-    self.syncTheme();
+    self.updateScrollbar();
 
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
+    if (app.config.@"window-inherit-font-size") {
+        if (parent) |v| config.@"font-size" = v.core_surface.font_size.points;
+    }
 
     try app.core_app.addSurface(self);
     errdefer app.core_app.deleteSurface(self);
@@ -91,20 +109,48 @@ pub fn create(app: *App, context: apprt.surface.NewSurfaceContext) !*Surface {
     try self.core_surface.init(alloc, &config, app.core_app, app, self);
     self.ready = true;
     _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
-
-    _ = c.ShowWindow(hwnd, if (config.maximize) c.SW_MAXIMIZE else c.SW_SHOW);
     return self;
 }
 
-/// Called from WM_DESTROY, while the window and so its DC still exist.
-pub fn deinit(self: *Surface) void {
+/// Must not be called within one of our callbacks.
+pub fn destroy(self: *Surface) void {
     const alloc = self.app.core_app.alloc;
     self.ready = false;
     _ = c.SetWindowLongPtrW(self.hwnd, c.GWLP_USERDATA, 0);
+
+    if (self.search) |v| v.destroy();
+    if (self.inspector) |v| v.destroy();
     self.app.core_app.deleteSurface(self);
+
+    // This joins the render thread and deletes its GL context, so must come
+    // before the window, and so its DC, is gone.
     self.core_surface.deinit();
+    _ = c.DestroyWindow(self.hwnd);
     if (self.title) |v| alloc.free(v);
     alloc.destroy(self);
+}
+
+/// Required by CoreApp, for surfaces left when it shuts down. There are none,
+/// because `App.terminate` destroys all windows first.
+pub fn deinit(self: *Surface) void {
+    self.destroy();
+}
+
+//---------------------------------------------------------------
+// SplitTree view API
+
+pub fn ref(self: *Surface) *Surface {
+    self.refs += 1;
+    return self;
+}
+
+pub fn unref(self: *Surface) void {
+    self.refs -= 1;
+    if (self.refs == 0) self.destroy();
+}
+
+pub fn eql(a: *const Surface, b: *const Surface) bool {
+    return a == b;
 }
 
 //---------------------------------------------------------------
@@ -182,7 +228,8 @@ pub fn clipboardRequest(
         .available = &available,
     }) catch |err| switch (err) {
         error.UnsafePaste, error.UnauthorizedPaste => {
-            const allowed = self.confirm(
+            const allowed = self.app.confirm(
+                self.window.hwnd,
                 c.L("Allow clipboard access?"),
                 if (err == error.UnsafePaste)
                     c.L("The text being pasted contains line breaks and may run commands.")
@@ -211,7 +258,8 @@ pub fn setClipboard(
         if (terminal.clipboard.isTextMime(v.mime)) break v.data;
     } else return;
 
-    if (confirm_write and !self.confirm(
+    if (confirm_write and !self.app.confirm(
+        self.window.hwnd,
         c.L("Allow clipboard access?"),
         c.L("An application is trying to write to the clipboard."),
     )) return;
@@ -224,86 +272,104 @@ pub fn setClipboard(
 
 pub fn setTitle(self: *Surface, title: [:0]const u8) !void {
     const alloc = self.app.core_app.alloc;
-    const title_w = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, title);
-    defer alloc.free(title_w);
     const copy = try alloc.dupeSentinel(u8, title, 0);
     if (self.title) |v| alloc.free(v);
     self.title = copy;
-    _ = c.SetWindowTextW(self.hwnd, title_w);
+    self.window.titleChanged(self);
 }
 
-pub fn setClientSize(self: *Surface, width: u32, height: u32) void {
-    if (self.windowed != null or c.IsZoomed(self.hwnd) != 0) return;
-    var rect: c.RECT = .{
-        .right = std.math.lossyCast(c_int, width),
-        .bottom = std.math.lossyCast(c_int, height),
-    };
-    self.adjustRect(&rect);
-    _ = c.SetWindowPos(
-        self.hwnd,
-        null,
-        0,
-        0,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        c.SWP_NOMOVE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-    );
+/// Move to another window.
+pub fn setWindow(self: *Surface, window: *Window) void {
+    self.window = window;
+    _ = c.SetParent(self.hwnd, window.hwnd);
 }
 
-/// Grow a client rect to include the window frame.
-fn adjustRect(self: *Surface, rect: *c.RECT) void {
-    const style: u32 = @truncate(@as(usize, @bitCast(c.GetWindowLongPtrW(self.hwnd, c.GWL_STYLE))));
-    _ = c.AdjustWindowRectExForDpi(rect, style, 0, 0, c.GetDpiForWindow(self.hwnd));
+pub fn setVisible(self: *Surface, visible: bool) void {
+    if (self.visible == visible) return;
+    self.visible = visible;
+    _ = c.ShowWindow(self.hwnd, if (visible) c.SW_SHOWNA else c.SW_HIDE);
+    self.setOccluded(!visible or self.window.minimized);
+    if (self.search) |v| v.reposition();
 }
 
-pub fn toggleMaximize(self: *Surface) void {
-    if (self.windowed != null) return;
-    _ = c.ShowWindow(self.hwnd, if (c.IsZoomed(self.hwnd) != 0) c.SW_RESTORE else c.SW_MAXIMIZE);
+/// Whether there's any point in rendering.
+pub fn setOccluded(self: *Surface, occluded: bool) void {
+    self.core_surface.occlusionCallback(!occluded) catch |err|
+        log.warn("error in occlusion callback err={}", .{err});
 }
 
-/// Borderless fullscreen on the current monitor.
-pub fn toggleFullscreen(self: *Surface) void {
-    if (self.windowed) |saved| {
-        self.windowed = null;
-        _ = c.SetWindowLongPtrW(self.hwnd, c.GWL_STYLE, saved.style);
-        _ = c.SetWindowPlacement(self.hwnd, &saved.placement);
-        _ = c.SetWindowPos(
-            self.hwnd,
-            null,
-            0,
-            0,
-            0,
-            0,
-            c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_FRAMECHANGED,
-        );
-        return;
+pub fn dpiChanged(self: *Surface) void {
+    const scale = self.getContentScale() catch return;
+    self.core_surface.contentScaleCallback(scale) catch |err|
+        log.warn("error in content scale callback err={}", .{err});
+}
+
+pub fn configChanged(self: *Surface) void {
+    const show = self.app.config.scrollbar == .system;
+    if (show != self.scrollbar_shown) {
+        self.scrollbar_shown = show;
+        _ = c.ShowScrollBar(self.hwnd, c.SB_VERT, @intFromBool(show));
     }
-
-    var info: c.MONITORINFO = .{};
-    const monitor = c.MonitorFromWindow(self.hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return;
-    if (c.GetMonitorInfoW(monitor, &info) == 0) return;
-    var placement: c.WINDOWPLACEMENT = .{};
-    if (c.GetWindowPlacement(self.hwnd, &placement) == 0) return;
-    const style = c.GetWindowLongPtrW(self.hwnd, c.GWL_STYLE);
-
-    self.windowed = .{ .placement = placement, .style = style };
-    _ = c.SetWindowLongPtrW(self.hwnd, c.GWL_STYLE, style & ~@as(isize, c.WS_OVERLAPPEDWINDOW));
-    const r = info.rcMonitor;
-    _ = c.SetWindowPos(
-        self.hwnd,
-        null,
-        r.left,
-        r.top,
-        r.right - r.left,
-        r.bottom - r.top,
-        c.SWP_NOZORDER | c.SWP_FRAMECHANGED,
-    );
+    self.updateScrollbar();
 }
 
-pub fn present(self: *Surface) void {
-    _ = c.ShowWindow(self.hwnd, c.SW_SHOW);
-    _ = c.SetForegroundWindow(self.hwnd);
+//---------------------------------------------------------------
+// Scrollbar
+
+pub fn scrollbarWidth(self: *const Surface) c_int {
+    const SM_CXVSCROLL = 2;
+    if (!self.scrollbar_shown) return 0;
+    return c.GetSystemMetricsForDpi(SM_CXVSCROLL, c.GetDpiForWindow(self.hwnd));
 }
+
+pub fn setScrollbar(self: *Surface, value: terminal.Scrollbar) void {
+    self.scrollbar = value;
+    self.updateScrollbar();
+}
+
+/// Rows per scrollbar unit. Scrollbars are limited to 31 bits.
+fn scrollUnit(self: *const Surface) usize {
+    return self.scrollbar.total / std.math.maxInt(i31) + 1;
+}
+
+fn updateScrollbar(self: *Surface) void {
+    if (!self.scrollbar_shown) return;
+    const unit = self.scrollUnit();
+
+    // Disabled rather than hidden if there's nothing to scroll, otherwise the
+    // terminal would change size, and so reflow, with the first scrollback.
+    _ = c.SetScrollInfo(self.hwnd, c.SB_VERT, &.{
+        .fMask = c.SIF_RANGE | c.SIF_PAGE | c.SIF_POS | c.SIF_DISABLENOSCROLL,
+        .nMin = 0,
+        .nMax = @intCast((self.scrollbar.total / unit) -| 1),
+        .nPage = @intCast(self.scrollbar.len / unit),
+        .nPos = @intCast(self.scrollbar.offset / unit),
+    }, 1);
+}
+
+fn onScroll(self: *Surface, code: u16) !void {
+    const bar = self.scrollbar;
+    const max = bar.total -| bar.len;
+    const row: usize = switch (code) {
+        c.SB_LINEUP => bar.offset -| 1,
+        c.SB_LINEDOWN => bar.offset + 1,
+        c.SB_PAGEUP => bar.offset -| bar.len,
+        c.SB_PAGEDOWN => bar.offset + bar.len,
+        c.SB_TOP => 0,
+        c.SB_BOTTOM => max,
+        c.SB_THUMBTRACK, c.SB_THUMBPOSITION => row: {
+            // The position in the message is only 16 bits.
+            var info: c.SCROLLINFO = .{ .fMask = c.SIF_TRACKPOS };
+            if (c.GetScrollInfo(self.hwnd, c.SB_VERT, &info) == 0) return;
+            break :row @as(usize, @intCast(@max(0, info.nTrackPos))) * self.scrollUnit();
+        },
+        else => return,
+    };
+    _ = try self.core_surface.performBindingAction(.{ .scroll_to_row = @min(row, max) });
+}
+
+//---------------------------------------------------------------
+// Mouse appearance
 
 pub fn setMouseVisible(self: *Surface, visible: bool) void {
     self.cursor_visible = visible;
@@ -335,25 +401,6 @@ fn applyCursor(self: *Surface) void {
     if (self.tracking_leave) _ = c.SetCursor(if (self.cursor_visible) self.cursor else null);
 }
 
-/// Match the title bar to the system theme.
-fn syncTheme(self: *Surface) void {
-    const dark: c.BOOL = @intFromBool(App.systemColorScheme() == .dark);
-    _ = c.DwmSetWindowAttribute(
-        self.hwnd,
-        c.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark,
-        @sizeOf(c.BOOL),
-    );
-}
-
-fn confirm(self: *Surface, title: [*:0]const u16, text: [*:0]const u16) bool {
-    self.modal += 1;
-    const result = c.MessageBoxW(self.hwnd, text, title, c.MB_OKCANCEL | c.MB_ICONWARNING);
-    self.modal -= 1;
-    if (self.modal == 0 and self.close_pending) self.close(false);
-    return result == c.IDOK;
-}
-
 //---------------------------------------------------------------
 // Window procedure
 
@@ -369,27 +416,24 @@ pub fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callc
     } orelse c.DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-/// Returns null for default processing. Once a core callback has returned,
-/// self is still valid: destruction only happens via a posted message.
+/// Returns null for default processing. After a core callback, self is still
+/// valid, because destruction only ever happens via a posted message.
 fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRESULT {
     const surface = &self.core_surface;
     switch (msg) {
-        c.WM_CLOSE => surface.close(),
-
         WM_CLOSE_SURFACE => {
-            // A message box is on the stack above a core callback.
-            if (self.modal > 0) {
+            // A message box is open, likely above a core callback.
+            if (self.app.modal > 0) {
                 self.close_pending = true;
                 return 0;
             }
-            if (wparam != 0 and !self.confirm(
+            if (wparam != 0 and !self.app.confirm(
+                self.window.hwnd,
                 c.L("Close terminal?"),
                 c.L("The running process in this terminal will be terminated."),
             )) return 0;
-            _ = c.DestroyWindow(self.hwnd);
+            try self.window.closeSurface(self);
         },
-
-        c.WM_DESTROY => self.deinit(),
 
         c.WM_PAINT => {
             _ = c.ValidateRect(self.hwnd, null);
@@ -400,51 +444,17 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
         c.WM_ERASEBKGND => return 1,
 
         c.WM_SIZE => {
-            const minimized = wparam == c.SIZE_MINIMIZED;
-            try surface.occlusionCallback(!minimized);
-            if (!minimized) {
-                const size = try self.getSize();
-                if (size.width > 0 and size.height > 0) try surface.sizeCallback(size);
-            }
+            const size = try self.getSize();
+            if (size.width > 0 and size.height > 0) try surface.sizeCallback(size);
+            if (self.search) |v| v.reposition();
         },
 
-        c.WM_GETMINMAXINFO => {
-            const info: *c.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            if (self.windowed != null) return null;
-            const limit = self.size_limit;
-            if (limit.min_width > 0 and limit.min_height > 0) {
-                var rect: c.RECT = .{
-                    .right = std.math.lossyCast(c_int, limit.min_width),
-                    .bottom = std.math.lossyCast(c_int, limit.min_height),
-                };
-                self.adjustRect(&rect);
-                info.ptMinTrackSize = .{ .x = rect.right - rect.left, .y = rect.bottom - rect.top };
-            }
-        },
+        c.WM_VSCROLL => try self.onScroll(@truncate(wparam)),
 
-        c.WM_DPICHANGED => {
-            const rect: *const c.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            try surface.contentScaleCallback(try self.getContentScale());
-            _ = c.SetWindowPos(
-                self.hwnd,
-                null,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-            );
+        c.WM_SETFOCUS => {
+            self.window.surfaceFocused(self);
+            try surface.focusCallback(true);
         },
-
-        c.WM_SETTINGCHANGE => {
-            self.syncTheme();
-            const scheme = App.systemColorScheme();
-            try self.app.core_app.colorSchemeEvent(self.app, scheme);
-            try surface.colorSchemeCallback(scheme);
-        },
-
-        c.WM_ACTIVATEAPP => self.app.core_app.focusEvent(wparam != 0),
-        c.WM_SETFOCUS => try surface.focusCallback(true),
         c.WM_KILLFOCUS => try surface.focusCallback(false),
 
         c.WM_SETCURSOR => {
@@ -458,6 +468,9 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
                 var track: c.TRACKMOUSEEVENT = .{ .dwFlags = c.TME_LEAVE, .hwndTrack = self.hwnd };
                 self.tracking_leave = c.TrackMouseEvent(&track) != 0;
             }
+            if (self.app.config.@"focus-follows-mouse" and
+                c.GetForegroundWindow() == self.window.hwnd and
+                c.GetFocus() != self.hwnd) _ = c.SetFocus(self.hwnd);
             try surface.cursorPosCallback(mousePos(lparam), currentMods());
         },
         c.WM_MOUSELEAVE => {
@@ -492,9 +505,8 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
             const effect = try self.key(if (repeat) .repeat else .press, wparam, lparam);
 
             // Alt+Space opens the system menu unless the terminal bound it.
-            // DefWindowProc does that in response to WM_SYSCHAR.
             if (effect == .ignored and msg == c.WM_SYSKEYDOWN and wparam == c.VK_SPACE)
-                return c.DefWindowProcW(self.hwnd, c.WM_SYSCHAR, c.VK_SPACE, lparam);
+                _ = c.PostMessageW(self.window.hwnd, c.WM_SYSCOMMAND, c.SC_KEYMENU, c.VK_SPACE);
         },
         c.WM_KEYUP, c.WM_SYSKEYUP => _ = try self.key(.release, wparam, lparam),
 
@@ -536,6 +548,7 @@ fn button(
     switch (action) {
         .press => {
             self.buttons_down +|= 1;
+            if (c.GetFocus() != self.hwnd) _ = c.SetFocus(self.hwnd);
             _ = c.SetCapture(self.hwnd);
         },
         .release => {

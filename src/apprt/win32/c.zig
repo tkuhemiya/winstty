@@ -259,3 +259,146 @@ pub extern "imm32" fn ImmSetCompositionWindow(HIMC, *const COMPOSITIONFORM) call
 
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) c_long;
 pub extern "shell32" fn ShellExecuteW(?HWND, ?[*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, c_int) callconv(.winapi) ?*anyopaque;
+
+//---------------------------------------------------------------
+// Windows, tabs and splits
+
+pub const HGDIOBJ = *anyopaque;
+pub const HFONT = *anyopaque;
+pub const HBITMAP = *anyopaque;
+pub const HMENU = *opaque {};
+pub const COLORREF = u32;
+
+pub const PAINTSTRUCT = extern struct {
+    hdc: ?HDC = null,
+    fErase: BOOL = 0,
+    rcPaint: RECT = .{},
+    fRestore: BOOL = 0,
+    fIncUpdate: BOOL = 0,
+    rgbReserved: [32]u8 = @splat(0),
+};
+pub const BITMAPINFOHEADER = extern struct {
+    biSize: u32 = @sizeOf(BITMAPINFOHEADER),
+    biWidth: c_int,
+    biHeight: c_int,
+    biPlanes: u16 = 1,
+    biBitCount: u16 = 32,
+    biCompression: u32 = 0,
+    biSizeImage: u32 = 0,
+    biXPelsPerMeter: c_int = 0,
+    biYPelsPerMeter: c_int = 0,
+    biClrUsed: u32 = 0,
+    biClrImportant: u32 = 0,
+};
+pub const BITMAPINFO = extern struct {
+    bmiHeader: BITMAPINFOHEADER,
+    bmiColors: [1]u32 = .{0},
+};
+pub const SCROLLINFO = extern struct {
+    cbSize: u32 = @sizeOf(SCROLLINFO),
+    fMask: u32,
+    nMin: c_int = 0,
+    nMax: c_int = 0,
+    nPage: u32 = 0,
+    nPos: c_int = 0,
+    nTrackPos: c_int = 0,
+};
+pub const DWM_BLURBEHIND = extern struct {
+    dwFlags: u32,
+    fEnable: BOOL,
+    hRgnBlur: ?*anyopaque = null,
+    fTransitionOnMaximized: BOOL = 0,
+};
+
+pub const CS_DBLCLKS = 0x8;
+pub const WS_CHILD: u32 = 0x40000000;
+pub const WS_POPUP: u32 = 0x80000000;
+pub const WS_VISIBLE: u32 = 0x10000000;
+pub const WS_CLIPSIBLINGS: u32 = 0x04000000;
+pub const WS_CLIPCHILDREN: u32 = 0x02000000;
+pub const WS_VSCROLL: u32 = 0x00200000;
+pub const WS_BORDER: u32 = 0x00800000;
+pub const WS_EX_TOOLWINDOW: u32 = 0x80;
+
+pub const SW_SHOWNA = 8;
+pub const SWP_SHOWWINDOW = 0x40;
+pub const SWP_HIDEWINDOW = 0x80;
+pub const SWP_NOCOPYBITS = 0x100;
+
+pub const WM_ACTIVATE = 0x0006;
+pub const WM_WINDOWPOSCHANGED = 0x0047;
+pub const WM_NCACTIVATE = 0x0086;
+pub const WM_COMMAND = 0x0111;
+pub const WM_SYSCOMMAND = 0x0112;
+pub const WM_VSCROLL = 0x0115;
+pub const WM_LBUTTONDBLCLK = 0x0203;
+pub const WM_RBUTTONDBLCLK = 0x0206;
+pub const WM_MBUTTONDBLCLK = 0x0209;
+pub const WM_XBUTTONDBLCLK = 0x020D;
+pub const WM_CAPTURECHANGED = 0x0215;
+pub const SC_KEYMENU = 0xF100;
+
+pub const DT_CENTER = 0x1;
+pub const DT_VCENTER = 0x4;
+pub const DT_SINGLELINE = 0x20;
+pub const DT_NOPREFIX = 0x800;
+pub const DT_END_ELLIPSIS = 0x8000;
+pub const TRANSPARENT = 1;
+pub const SRCCOPY = 0x00CC0020;
+
+pub const SB_VERT = 1;
+pub const SB_LINEUP = 0;
+pub const SB_LINEDOWN = 1;
+pub const SB_PAGEUP = 2;
+pub const SB_PAGEDOWN = 3;
+pub const SB_THUMBPOSITION = 4;
+pub const SB_THUMBTRACK = 5;
+pub const SB_TOP = 6;
+pub const SB_BOTTOM = 7;
+pub const SIF_RANGE = 0x1;
+pub const SIF_PAGE = 0x2;
+pub const SIF_POS = 0x4;
+pub const SIF_DISABLENOSCROLL = 0x8;
+pub const SIF_TRACKPOS = 0x10;
+
+pub const DWM_BB_ENABLE = 1;
+pub const DWM_BB_BLURREGION = 2;
+pub const DWMWA_CAPTION_COLOR = 35;
+pub const DWMWA_TEXT_COLOR = 36;
+pub const DWMWA_SYSTEMBACKDROP_TYPE = 38;
+pub const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
+
+pub extern "user32" fn BeginPaint(HWND, *PAINTSTRUCT) callconv(.winapi) ?HDC;
+pub extern "user32" fn EndPaint(HWND, *const PAINTSTRUCT) callconv(.winapi) BOOL;
+pub extern "user32" fn InvalidateRect(HWND, ?*const RECT, BOOL) callconv(.winapi) BOOL;
+pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
+pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
+pub extern "user32" fn IsWindowVisible(HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn IsIconic(HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn SetParent(HWND, ?HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
+pub extern "user32" fn GetDC(?HWND) callconv(.winapi) ?HDC;
+pub extern "user32" fn ReleaseDC(?HWND, HDC) callconv(.winapi) c_int;
+pub extern "user32" fn ClientToScreen(HWND, *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetSystemMetricsForDpi(c_int, u32) callconv(.winapi) c_int;
+pub extern "user32" fn SetScrollInfo(HWND, c_int, *const SCROLLINFO, BOOL) callconv(.winapi) c_int;
+pub extern "user32" fn GetScrollInfo(HWND, c_int, *SCROLLINFO) callconv(.winapi) BOOL;
+pub extern "user32" fn ShowScrollBar(HWND, c_int, BOOL) callconv(.winapi) BOOL;
+pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, u32) callconv(.winapi) c_int;
+pub extern "user32" fn FillRect(HDC, *const RECT, HGDIOBJ) callconv(.winapi) c_int;
+pub extern "user32" fn SendMessageW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+pub extern "gdi32" fn CreateCompatibleDC(?HDC) callconv(.winapi) ?HDC;
+pub extern "gdi32" fn DeleteDC(HDC) callconv(.winapi) BOOL;
+pub extern "gdi32" fn CreateDIBSection(?HDC, *const BITMAPINFO, u32, *?*anyopaque, ?HANDLE, u32) callconv(.winapi) ?HBITMAP;
+pub extern "gdi32" fn SelectObject(HDC, HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
+pub extern "gdi32" fn DeleteObject(HGDIOBJ) callconv(.winapi) BOOL;
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
+pub extern "gdi32" fn BitBlt(HDC, c_int, c_int, c_int, c_int, HDC, c_int, c_int, u32) callconv(.winapi) BOOL;
+pub extern "gdi32" fn CreateSolidBrush(COLORREF) callconv(.winapi) ?HGDIOBJ;
+pub extern "gdi32" fn SetBkMode(HDC, c_int) callconv(.winapi) c_int;
+pub extern "gdi32" fn SetTextColor(HDC, COLORREF) callconv(.winapi) COLORREF;
+pub extern "gdi32" fn CreateFontW(c_int, c_int, c_int, c_int, c_int, u32, u32, u32, u32, u32, u32, u32, u32, [*:0]const u16) callconv(.winapi) ?HFONT;
+pub extern "gdi32" fn CreateRectRgn(c_int, c_int, c_int, c_int) callconv(.winapi) ?HGDIOBJ;
+pub extern "dwmapi" fn DwmEnableBlurBehindWindow(HWND, *const DWM_BLURBEHIND) callconv(.winapi) c_long;

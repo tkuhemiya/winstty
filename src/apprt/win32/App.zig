@@ -7,12 +7,17 @@ const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
+const InspectorWindow = @import("InspectorWindow.zig");
+const SearchBar = @import("SearchBar.zig");
+const CommandPalette = @import("CommandPalette.zig");
 const Surface = @import("Surface.zig");
+const Window = @import("Window.zig");
 const c = @import("c.zig");
 
 const log = std.log.scoped(.win32);
 
 pub const window_class = c.L("GhosttyWindow");
+pub const surface_class = c.L("GhosttySurface");
 const app_class = c.L("GhosttyApp");
 
 /// Posted to the message-only window to drain the core mailbox.
@@ -28,6 +33,13 @@ hinstance: c.HINSTANCE,
 /// because thread messages are lost while a modal loop (window resize, menu,
 /// message box) is pumping.
 hwnd: c.HWND,
+
+windows: std.ArrayList(*Window) = .empty,
+last_tab_id: u32 = 0,
+
+/// The number of open message boxes. They pump messages, and may have been
+/// opened from inside a core callback, so nothing may be destroyed meanwhile.
+modal: u32 = 0,
 
 /// Set once we've started exiting, so teardown doesn't re-enter.
 quitting: bool = false,
@@ -51,14 +63,23 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
     const hinstance = c.GetModuleHandleW(null) orelse return error.Win32Failed;
     const icon = c.LoadIconW(hinstance, 1);
     if (c.RegisterClassExW(&.{
-        // The WGL context holds on to the window's DC, so it must be owned.
-        .style = c.CS_OWNDC,
-        .lpfnWndProc = Surface.wndProc,
+        .style = c.CS_DBLCLKS,
+        .lpfnWndProc = Window.wndProc,
         .hInstance = hinstance,
         .hIcon = icon,
         .hIconSm = icon,
         .lpszClassName = window_class,
     }) == 0) return error.Win32Failed;
+    if (c.RegisterClassExW(&.{
+        // The WGL context holds on to the window's DC, so it must be owned.
+        .style = c.CS_OWNDC,
+        .lpfnWndProc = Surface.wndProc,
+        .hInstance = hinstance,
+        .lpszClassName = surface_class,
+    }) == 0) return error.Win32Failed;
+    try SearchBar.register(hinstance);
+    try CommandPalette.register(hinstance);
+    try InspectorWindow.register(hinstance);
     if (c.RegisterClassExW(&.{
         .lpfnWndProc = wndProc,
         .hInstance = hinstance,
@@ -92,7 +113,7 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
 }
 
 pub fn run(self: *App) !void {
-    _ = try Surface.create(self, .window);
+    _ = try Window.create(self);
 
     var msg: c.MSG = undefined;
     while (true) {
@@ -117,6 +138,7 @@ pub fn run(self: *App) !void {
 pub fn terminate(self: *App) void {
     self.closeAll();
     _ = c.DestroyWindow(self.hwnd);
+    self.windows.deinit(self.core_app.alloc);
     self.config.deinit();
 }
 
@@ -133,13 +155,12 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
         WM_WAKEUP => self.core_app.tick(self) catch |err|
             log.err("error in app tick err={}", .{err}),
 
-        WM_QUIT_APP => if (!self.quitting) {
-            if (self.core_app.needsConfirmQuit() and c.MessageBoxW(
+        WM_QUIT_APP => if (!self.quitting and self.modal == 0) {
+            if (self.core_app.needsConfirmQuit() and !self.confirm(
                 null,
-                c.L("All terminal sessions will be terminated."),
                 c.L("Quit Ghostty?"),
-                c.MB_OKCANCEL | c.MB_ICONWARNING,
-            ) != c.IDOK) return 0;
+                c.L("All terminal sessions will be terminated."),
+            )) return 0;
             self.closeAll();
             c.PostQuitMessage(0);
         },
@@ -151,13 +172,45 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
 
 fn closeAll(self: *App) void {
     self.quitting = true;
-    while (self.core_app.surfaces.items.len > 0) {
-        const len = self.core_app.surfaces.items.len;
-        _ = c.DestroyWindow(self.core_app.surfaces.items[len - 1].hwnd);
+    while (self.windows.items.len > 0) {
+        const len = self.windows.items.len;
+        _ = c.DestroyWindow(self.windows.items[len - 1].hwnd);
 
-        // Destroying the window removes the surface. If it somehow didn't,
-        // don't spin.
-        if (self.core_app.surfaces.items.len >= len) return;
+        // Destroying the window removes it. If it somehow didn't, don't spin.
+        if (self.windows.items.len >= len) return;
+    }
+}
+
+pub fn nextTabId(self: *App) u32 {
+    self.last_tab_id += 1;
+    return self.last_tab_id;
+}
+
+/// Ask the user to confirm something. Other messages are handled meanwhile.
+pub fn confirm(
+    self: *App,
+    owner: ?c.HWND,
+    title: [*:0]const u16,
+    text: [*:0]const u16,
+) bool {
+    self.modal += 1;
+    const result = c.MessageBoxW(owner, text, title, c.MB_OKCANCEL | c.MB_ICONWARNING);
+    self.modal -= 1;
+
+    // Surfaces that wanted to close can, now.
+    if (self.modal == 0) for (self.core_app.surfaces.items) |surface| {
+        if (!surface.close_pending) continue;
+        surface.close_pending = false;
+        surface.close(false);
+    };
+    return result == c.IDOK;
+}
+
+pub fn colorSchemeChanged(self: *App) !void {
+    const scheme = systemColorScheme();
+    try self.core_app.colorSchemeEvent(self, scheme);
+    for (self.core_app.surfaces.items) |surface| {
+        try surface.core_surface.colorSchemeCallback(scheme);
     }
 }
 
@@ -202,16 +255,68 @@ pub fn performAction(
             .stop => {},
         },
 
-        .new_window => _ = try Surface.create(self, .window),
+        .new_window => _ = try Window.create(self),
+
+        .new_tab => {
+            const v = surface orelse {
+                _ = try Window.create(self);
+                return true;
+            };
+            _ = try v.window.newTab(.tab);
+        },
+        .close_tab => return (surface orelse return false).window.requestCloseTab(surface.?, value),
+        .goto_tab => return (surface orelse return false).window.gotoTab(value),
+        .move_tab => return (surface orelse return false).window.moveTab(surface.?, value.amount),
+        .move_tab_to_new_window => return try (surface orelse return false).window.moveTabToNewWindow(surface.?),
+        .new_split => return try (surface orelse return false).window.newSplit(surface.?, value),
+        .goto_split => return try (surface orelse return false).window.gotoSplit(surface.?, value),
+        .resize_split => return try (surface orelse return false).window.resizeSplit(surface.?, value),
+        .equalize_splits => return try (surface orelse return false).window.equalizeSplits(surface.?),
+        .toggle_split_zoom => return (surface orelse return false).window.toggleZoom(surface.?),
+        .goto_window => return self.gotoWindow(surface orelse return false, value),
+
+        .scrollbar => (surface orelse return false).setScrollbar(value),
+
+        .start_search => {
+            const v = surface orelse return false;
+            if (v.search == null) v.search = try SearchBar.create(v);
+            v.search.?.show(value.needle);
+        },
+        .end_search => if ((surface orelse return false).search) |v| v.hide(),
+        .search_total => if ((surface orelse return false).search) |v| v.setTotal(value.total),
+        .search_selected => if ((surface orelse return false).search) |v| v.setSelected(value.selected),
+
+        .toggle_command_palette => {
+            const window = (surface orelse return false).window;
+            if (window.palette == null) window.palette = try CommandPalette.create(window);
+            window.palette.?.toggle();
+        },
+
+        .inspector => {
+            const v = surface orelse return false;
+            const show = switch (value) {
+                .toggle => v.inspector == null,
+                .show => true,
+                .hide => false,
+            };
+            if (show == (v.inspector != null)) return false;
+            if (show) {
+                v.inspector = try InspectorWindow.create(v);
+            } else {
+                // Deferred, the inspector may be what we're being called from.
+                v.inspector.?.close();
+            }
+        },
+        .render_inspector => if ((surface orelse return false).inspector) |v| v.queueRender(),
 
         .close_window => _ = c.PostMessageW(
-            (surface orelse return false).hwnd,
+            (surface orelse return false).window.hwnd,
             c.WM_CLOSE,
             0,
             0,
         ),
 
-        .close_all_windows => for (self.core_app.surfaces.items) |v| {
+        .close_all_windows => for (self.windows.items) |v| {
             _ = c.PostMessageW(v.hwnd, c.WM_CLOSE, 0, 0);
         },
 
@@ -219,16 +324,16 @@ pub fn performAction(
         .open_config => return try self.openConfig(),
         .open_url => return try self.openUrl(value),
 
-        .set_title,
-        .set_window_title,
-        => try (surface orelse return false).setTitle(value.title),
-        .toggle_fullscreen => (surface orelse return false).toggleFullscreen(),
-        .toggle_maximize => (surface orelse return false).toggleMaximize(),
+        .set_title => try (surface orelse return false).setTitle(value.title),
+        .set_tab_title => return try (surface orelse return false).window.setTabTitle(surface.?, value.title),
+        .set_window_title => try (surface orelse return false).window.setWindowTitle(value.title),
+        .toggle_fullscreen => (surface orelse return false).window.toggleFullscreen(),
+        .toggle_maximize => (surface orelse return false).window.toggleMaximize(),
         .mouse_shape => (surface orelse return false).setMouseShape(value),
         .mouse_visibility => (surface orelse return false).setMouseVisible(value == .visible),
-        .initial_size => (surface orelse return false).setClientSize(value.width, value.height),
-        .size_limit => (surface orelse return false).size_limit = value,
-        .present_terminal => (surface orelse return false).present(),
+        .initial_size => (surface orelse return false).window.setSurfaceSize(surface.?, value.width, value.height),
+        .size_limit => (surface orelse return false).window.size_limit = value,
+        .present_terminal => (surface orelse return false).window.present(surface.?),
         .ring_bell => _ = c.MessageBeep(0),
 
         // The render thread presents on its own, there's nothing to queue.
@@ -242,6 +347,20 @@ pub fn performAction(
     return true;
 }
 
+fn gotoWindow(self: *App, from: *Surface, to: apprt.action.GotoWindow) bool {
+    const len = self.windows.items.len;
+    if (len < 2) return false;
+    const index = std.mem.indexOfScalar(*Window, self.windows.items, from.window) orelse return false;
+    const window = self.windows.items[
+        switch (to) {
+            .next => (index + 1) % len,
+            .previous => (index + len - 1) % len,
+        }
+    ];
+    window.present(window.activeSurface() orelse return false);
+    return true;
+}
+
 fn reloadConfig(self: *App, soft: bool) !void {
     if (!soft) {
         const config = try Config.load(self.core_app.alloc);
@@ -249,6 +368,7 @@ fn reloadConfig(self: *App, soft: bool) !void {
         self.config = config;
     }
     try self.core_app.updateConfig(self, &self.config);
+    for (self.windows.items) |window| window.configChanged();
 }
 
 fn openConfig(self: *App) !bool {
