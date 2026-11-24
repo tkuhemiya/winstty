@@ -11,6 +11,7 @@ const terminal = @import("../../terminal/main.zig");
 const CoreSurface = @import("../../Surface.zig");
 const App = @import("App.zig");
 const InspectorWindow = @import("InspectorWindow.zig");
+const Scrollbar = @import("Scrollbar.zig");
 const SearchBar = @import("SearchBar.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
@@ -38,8 +39,8 @@ visible: bool = false,
 
 search: ?*SearchBar = null,
 inspector: ?*InspectorWindow = null,
-scrollbar: terminal.Scrollbar = .zero,
-scrollbar_shown: bool = false,
+scrollbar: ?*Scrollbar = null,
+scrollbar_state: terminal.Scrollbar = .zero,
 
 cursor: ?c.HCURSOR,
 cursor_visible: bool = true,
@@ -71,15 +72,17 @@ pub fn create(
     const self = try alloc.create(Surface);
     errdefer alloc.destroy(self);
 
-    const scrollbar = app.config.scrollbar == .system;
     const hwnd = c.CreateWindowExW(
         0,
         App.surface_class,
         c.L(""),
-        c.WS_CHILD | c.WS_CLIPSIBLINGS | if (scrollbar) c.WS_VSCROLL else 0,
+        c.WS_CHILD | c.WS_CLIPSIBLINGS,
         rect.left,
         rect.top,
-        @max(1, rect.right - rect.left),
+        @max(1, rect.right - rect.left - if (app.config.scrollbar == .system)
+            Scrollbar.width(window.getDpi())
+        else
+            0),
         @max(1, rect.bottom - rect.top),
         window.hwnd,
         null,
@@ -93,9 +96,9 @@ pub fn create(
         .window = window,
         .hwnd = hwnd,
         .cursor = c.LoadCursorW(null, c.IDC_IBEAM),
-        .scrollbar_shown = scrollbar,
     };
-    self.updateScrollbar();
+    try self.syncScrollbar();
+    errdefer if (self.scrollbar) |v| v.destroy();
 
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
@@ -120,6 +123,7 @@ pub fn destroy(self: *Surface) void {
 
     if (self.search) |v| v.destroy();
     if (self.inspector) |v| v.destroy();
+    if (self.scrollbar) |v| v.destroy();
     self.app.core_app.deleteSurface(self);
 
     // This joins the render thread and deletes its GL context, so must come
@@ -282,12 +286,15 @@ pub fn setTitle(self: *Surface, title: [:0]const u8) !void {
 pub fn setWindow(self: *Surface, window: *Window) void {
     self.window = window;
     _ = c.SetParent(self.hwnd, window.hwnd);
+    if (self.scrollbar) |v| _ = c.SetParent(v.hwnd, window.hwnd);
 }
 
 pub fn setVisible(self: *Surface, visible: bool) void {
     if (self.visible == visible) return;
     self.visible = visible;
-    _ = c.ShowWindow(self.hwnd, if (visible) c.SW_SHOWNA else c.SW_HIDE);
+    const show: c_int = if (visible) c.SW_SHOWNA else c.SW_HIDE;
+    _ = c.ShowWindow(self.hwnd, show);
+    if (self.scrollbar) |v| _ = c.ShowWindow(v.hwnd, show);
     self.setOccluded(!visible or self.window.minimized);
     if (self.search) |v| v.reposition();
 }
@@ -304,68 +311,60 @@ pub fn dpiChanged(self: *Surface) void {
         log.warn("error in content scale callback err={}", .{err});
 }
 
-pub fn configChanged(self: *Surface) void {
-    const show = self.app.config.scrollbar == .system;
-    if (show != self.scrollbar_shown) {
-        self.scrollbar_shown = show;
-        _ = c.ShowScrollBar(self.hwnd, c.SB_VERT, @intFromBool(show));
-    }
-    self.updateScrollbar();
+/// Position within the window.
+pub fn place(self: *Surface, area: c.RECT) void {
+    const flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_NOCOPYBITS;
+    const height = @max(1, area.bottom - area.top);
+    const bar = self.scrollbarWidth();
+    _ = c.SetWindowPos(
+        self.hwnd,
+        null,
+        area.left,
+        area.top,
+        @max(1, area.right - area.left - bar),
+        height,
+        flags,
+    );
+    if (self.scrollbar) |v| _ = c.SetWindowPos(
+        v.hwnd,
+        null,
+        @max(area.left, area.right - bar),
+        area.top,
+        bar,
+        height,
+        flags,
+    );
 }
 
-//---------------------------------------------------------------
-// Scrollbar
+pub fn configChanged(self: *Surface) void {
+    self.syncScrollbar() catch |err| log.warn("error creating scrollbar err={}", .{err});
+    if (self.scrollbar) |v| v.invalidate();
+}
 
 pub fn scrollbarWidth(self: *const Surface) c_int {
-    const SM_CXVSCROLL = 2;
-    if (!self.scrollbar_shown) return 0;
-    return c.GetSystemMetricsForDpi(SM_CXVSCROLL, c.GetDpiForWindow(self.hwnd));
+    if (self.scrollbar == null) return 0;
+    return Scrollbar.width(c.GetDpiForWindow(self.hwnd));
 }
 
 pub fn setScrollbar(self: *Surface, value: terminal.Scrollbar) void {
-    self.scrollbar = value;
-    self.updateScrollbar();
+    self.scrollbar_state = value;
+    if (self.scrollbar) |v| v.set(value);
 }
 
-/// Rows per scrollbar unit. Scrollbars are limited to 31 bits.
-fn scrollUnit(self: *const Surface) usize {
-    return self.scrollbar.total / std.math.maxInt(i31) + 1;
-}
-
-fn updateScrollbar(self: *Surface) void {
-    if (!self.scrollbar_shown) return;
-    const unit = self.scrollUnit();
-
-    // Disabled rather than hidden if there's nothing to scroll, otherwise the
-    // terminal would change size, and so reflow, with the first scrollback.
-    _ = c.SetScrollInfo(self.hwnd, c.SB_VERT, &.{
-        .fMask = c.SIF_RANGE | c.SIF_PAGE | c.SIF_POS | c.SIF_DISABLENOSCROLL,
-        .nMin = 0,
-        .nMax = @intCast((self.scrollbar.total / unit) -| 1),
-        .nPage = @intCast(self.scrollbar.len / unit),
-        .nPos = @intCast(self.scrollbar.offset / unit),
-    }, 1);
-}
-
-fn onScroll(self: *Surface, code: u16) !void {
-    const bar = self.scrollbar;
-    const max = bar.total -| bar.len;
-    const row: usize = switch (code) {
-        c.SB_LINEUP => bar.offset -| 1,
-        c.SB_LINEDOWN => bar.offset + 1,
-        c.SB_PAGEUP => bar.offset -| bar.len,
-        c.SB_PAGEDOWN => bar.offset + bar.len,
-        c.SB_TOP => 0,
-        c.SB_BOTTOM => max,
-        c.SB_THUMBTRACK, c.SB_THUMBPOSITION => row: {
-            // The position in the message is only 16 bits.
-            var info: c.SCROLLINFO = .{ .fMask = c.SIF_TRACKPOS };
-            if (c.GetScrollInfo(self.hwnd, c.SB_VERT, &info) == 0) return;
-            break :row @as(usize, @intCast(@max(0, info.nTrackPos))) * self.scrollUnit();
+/// Create or destroy the scrollbar as configured.
+fn syncScrollbar(self: *Surface) !void {
+    switch (self.app.config.scrollbar) {
+        .system => if (self.scrollbar == null) {
+            const v: *Scrollbar = try .create(self);
+            v.state = self.scrollbar_state;
+            if (self.visible) _ = c.ShowWindow(v.hwnd, c.SW_SHOWNA);
+            self.scrollbar = v;
         },
-        else => return,
-    };
-    _ = try self.core_surface.performBindingAction(.{ .scroll_to_row = @min(row, max) });
+        .never => if (self.scrollbar) |v| {
+            v.destroy();
+            self.scrollbar = null;
+        },
+    }
 }
 
 //---------------------------------------------------------------
@@ -448,8 +447,6 @@ fn message(self: *Surface, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRE
             if (size.width > 0 and size.height > 0) try surface.sizeCallback(size);
             if (self.search) |v| v.reposition();
         },
-
-        c.WM_VSCROLL => try self.onScroll(@truncate(wparam)),
 
         c.WM_SETFOCUS => {
             self.window.surfaceFocused(self);

@@ -294,15 +294,6 @@ pub const BITMAPINFO = extern struct {
     bmiHeader: BITMAPINFOHEADER,
     bmiColors: [1]u32 = .{0},
 };
-pub const SCROLLINFO = extern struct {
-    cbSize: u32 = @sizeOf(SCROLLINFO),
-    fMask: u32,
-    nMin: c_int = 0,
-    nMax: c_int = 0,
-    nPage: u32 = 0,
-    nPos: c_int = 0,
-    nTrackPos: c_int = 0,
-};
 pub const DWM_BLURBEHIND = extern struct {
     dwFlags: u32,
     fEnable: BOOL,
@@ -316,7 +307,6 @@ pub const WS_POPUP: u32 = 0x80000000;
 pub const WS_VISIBLE: u32 = 0x10000000;
 pub const WS_CLIPSIBLINGS: u32 = 0x04000000;
 pub const WS_CLIPCHILDREN: u32 = 0x02000000;
-pub const WS_VSCROLL: u32 = 0x00200000;
 pub const WS_BORDER: u32 = 0x00800000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x80;
 
@@ -330,7 +320,6 @@ pub const WM_WINDOWPOSCHANGED = 0x0047;
 pub const WM_NCACTIVATE = 0x0086;
 pub const WM_COMMAND = 0x0111;
 pub const WM_SYSCOMMAND = 0x0112;
-pub const WM_VSCROLL = 0x0115;
 pub const WM_LBUTTONDBLCLK = 0x0203;
 pub const WM_RBUTTONDBLCLK = 0x0206;
 pub const WM_MBUTTONDBLCLK = 0x0209;
@@ -345,21 +334,6 @@ pub const DT_NOPREFIX = 0x800;
 pub const DT_END_ELLIPSIS = 0x8000;
 pub const TRANSPARENT = 1;
 pub const SRCCOPY = 0x00CC0020;
-
-pub const SB_VERT = 1;
-pub const SB_LINEUP = 0;
-pub const SB_LINEDOWN = 1;
-pub const SB_PAGEUP = 2;
-pub const SB_PAGEDOWN = 3;
-pub const SB_THUMBPOSITION = 4;
-pub const SB_THUMBTRACK = 5;
-pub const SB_TOP = 6;
-pub const SB_BOTTOM = 7;
-pub const SIF_RANGE = 0x1;
-pub const SIF_PAGE = 0x2;
-pub const SIF_POS = 0x4;
-pub const SIF_DISABLENOSCROLL = 0x8;
-pub const SIF_TRACKPOS = 0x10;
 
 pub const DWM_BB_ENABLE = 1;
 pub const DWM_BB_BLURREGION = 2;
@@ -383,9 +357,6 @@ pub extern "user32" fn GetDC(?HWND) callconv(.winapi) ?HDC;
 pub extern "user32" fn ReleaseDC(?HWND, HDC) callconv(.winapi) c_int;
 pub extern "user32" fn ClientToScreen(HWND, *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetSystemMetricsForDpi(c_int, u32) callconv(.winapi) c_int;
-pub extern "user32" fn SetScrollInfo(HWND, c_int, *const SCROLLINFO, BOOL) callconv(.winapi) c_int;
-pub extern "user32" fn GetScrollInfo(HWND, c_int, *SCROLLINFO) callconv(.winapi) BOOL;
-pub extern "user32" fn ShowScrollBar(HWND, c_int, BOOL) callconv(.winapi) BOOL;
 pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, u32) callconv(.winapi) c_int;
 pub extern "user32" fn FillRect(HDC, *const RECT, HGDIOBJ) callconv(.winapi) c_int;
 pub extern "user32" fn SendMessageW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;

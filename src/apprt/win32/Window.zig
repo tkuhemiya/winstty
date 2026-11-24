@@ -642,15 +642,7 @@ fn relayout(self: *Window) void {
 fn layoutNode(self: *Window, tab: *Tab, handle: Tree.Node.Handle, area: c.RECT) void {
     switch (tab.tree.nodes[handle.idx()]) {
         .leaf => |surface| {
-            _ = c.SetWindowPos(
-                surface.hwnd,
-                null,
-                area.left,
-                area.top,
-                @max(1, area.right - area.left),
-                @max(1, area.bottom - area.top),
-                c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_NOCOPYBITS,
-            );
+            surface.place(area);
             surface.setVisible(true);
         },
 

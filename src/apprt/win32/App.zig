@@ -8,6 +8,7 @@ const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const InspectorWindow = @import("InspectorWindow.zig");
+const Scrollbar = @import("Scrollbar.zig");
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const Surface = @import("Surface.zig");
@@ -77,6 +78,7 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
         .hInstance = hinstance,
         .lpszClassName = surface_class,
     }) == 0) return error.Win32Failed;
+    try Scrollbar.register(hinstance);
     try SearchBar.register(hinstance);
     try CommandPalette.register(hinstance);
     try InspectorWindow.register(hinstance);
