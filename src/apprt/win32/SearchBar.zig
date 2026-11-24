@@ -243,6 +243,10 @@ pub fn reposition(self: *SearchBar) void {
 
     var client: c.RECT = .{};
     _ = c.GetClientRect(surface.hwnd, &client);
+
+    // It may be larger than what's shown of it.
+    if (surface.area.cx > 0) client.right = @min(client.right, surface.area.cx);
+    if (surface.area.cy > 0) client.bottom = @min(client.bottom, surface.area.cy);
     const margin = paint.scale(bar_margin, self.dpi);
     const width = @min(paint.scale(bar_width, self.dpi), client.right - margin * 2);
     const height = paint.scale(bar_height, self.dpi);

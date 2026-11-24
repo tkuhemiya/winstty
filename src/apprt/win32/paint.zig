@@ -197,6 +197,56 @@ pub fn uiFont(points: c_int, dpi: u32) ?c.HFONT {
     );
 }
 
+/// What a window looks like. Parts of it are drawn to this, and it's shown all
+/// at once, as each time something is shown waits for the compositor.
+pub const Back = struct {
+    dc: c.HDC,
+    bitmap: c.HBITMAP,
+    previous: ?c.HGDIOBJ,
+    width: c_int,
+    height: c_int,
+
+    pub fn init(target: c.HDC, width: c_int, height: c_int) ?Back {
+        if (width <= 0 or height <= 0) return null;
+        const dc = c.CreateCompatibleDC(target) orelse return null;
+        var bits: ?*anyopaque = null;
+        const bitmap = c.CreateDIBSection(dc, &.{
+            // Negative is top-down.
+            .bmiHeader = .{ .biWidth = width, .biHeight = -height },
+        }, 0, &bits, null, 0) orelse {
+            _ = c.DeleteDC(dc);
+            return null;
+        };
+        return .{
+            .dc = dc,
+            .bitmap = bitmap,
+            .previous = c.SelectObject(dc, bitmap),
+            .width = width,
+            .height = height,
+        };
+    }
+
+    pub fn deinit(self: Back) void {
+        if (self.previous) |v| _ = c.SelectObject(self.dc, v);
+        _ = c.DeleteObject(self.bitmap);
+        _ = c.DeleteDC(self.dc);
+    }
+
+    pub fn show(self: Back, target: c.HDC, rect: c.RECT) void {
+        _ = c.BitBlt(
+            target,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            self.dc,
+            rect.left,
+            rect.top,
+            c.SRCCOPY,
+        );
+    }
+};
+
 /// An offscreen buffer for flicker-free painting.
 ///
 /// GDI writes zeroes to the alpha channel, and the window may be composited
@@ -286,6 +336,21 @@ pub const Buffer = struct {
     /// Premultiplies in linear space, as the terminal's renderer does, so that
     /// the same color next to it looks the same.
     fn premultiplied(opacity: u8) [256]u8 {
+        // Painting is all done by one thread, and there are only a few.
+        const cache = struct {
+            var tables: [4][256]u8 = undefined;
+            var opacities: [4]?u8 = @splat(null);
+            var next: usize = 0;
+        };
+        for (cache.opacities, 0..) |v, i| if (v != null and v.? == opacity) return cache.tables[i];
+        const table = computePremultiplied(opacity);
+        cache.tables[cache.next] = table;
+        cache.opacities[cache.next] = opacity;
+        cache.next = (cache.next + 1) % cache.tables.len;
+        return table;
+    }
+
+    fn computePremultiplied(opacity: u8) [256]u8 {
         const alpha = @as(f32, @floatFromInt(opacity)) / 255;
         var table: [256]u8 = undefined;
         for (&table, 0..) |*v, i| {
@@ -396,19 +461,42 @@ pub const Buffer = struct {
         const target = [4]u32{ table[color.b], table[color.g], table[color.r], opacity };
         const limited = @min(radius, @min(r.w, r.h) / 2);
         const b = self.bounds(r);
-        for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
-            const d = distance(r, limited, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
-            const t: u32 = @intFromFloat(std.math.clamp(0.5 - d, 0, 1) * 255);
-            if (t == 0) continue;
-            const pixel = &self.pixels[y * self.width + x];
-            var out: u32 = 0;
-            for (target, 0..) |v, i| {
-                const shift: u5 = @intCast(i * 8);
-                const old = (pixel.* >> shift) & 0xFF;
-                out |= ((old * (255 - t) + v * t) / 255) << shift;
-            }
-            pixel.* = out;
-        };
+        const solid = target[3] << 24 | target[2] << 16 | target[1] << 8 | target[0];
+        for (b.y0..b.y1) |y| {
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            const x0, const x1 = insideOf(r, limited, py, b);
+            for (b.x0..x0) |x| self.replacePixel(r, limited, target, x, y, py);
+            if (x1 > x0) @memset(self.pixels[y * self.width + x0 .. y * self.width + x1], solid);
+            for (x1..b.x1) |x| self.replacePixel(r, limited, target, x, y, py);
+        }
+    }
+
+    fn replacePixel(self: Buffer, r: Rect, radius: f32, target: [4]u32, x: usize, y: usize, py: f32) void {
+        const d = distance(r, radius, @as(f32, @floatFromInt(x)) + 0.5, py);
+        const t: u32 = @intFromFloat(std.math.clamp(0.5 - d, 0, 1) * 255);
+        if (t == 0) return;
+        const pixel = &self.pixels[y * self.width + x];
+        var out: u32 = 0;
+        for (target, 0..) |v, i| {
+            const shift: u5 = @intCast(i * 8);
+            const old = (pixel.* >> shift) & 0xFF;
+            out |= ((old * (255 - t) + v * t) / 255) << shift;
+        }
+        pixel.* = out;
+    }
+
+    /// The part of a row of pixels that's surely all inside of a rounded
+    /// rectangle: all of it between the corners, and what's between them
+    /// otherwise.
+    fn insideOf(r: Rect, radius: f32, py: f32, b: Bounds) struct { usize, usize } {
+        if (py < r.y + 1 or py > r.y + r.h - 1) return .{ b.x1, b.x1 };
+        const edge = if (py > r.y + radius and py < r.y + r.h - radius) 1 else radius + 1;
+        const lo: f32 = @floatFromInt(b.x0);
+        const hi: f32 = @floatFromInt(b.x1);
+        const x0 = std.math.clamp(@ceil(r.x + edge), lo, hi);
+        const x1 = std.math.clamp(@floor(r.x + r.w - edge), lo, hi);
+        if (x1 <= x0) return .{ b.x1, b.x1 };
+        return .{ @intFromFloat(x0), @intFromFloat(x1) };
     }
 
     /// A solid line along the inside of a rounded rectangle.
@@ -417,18 +505,35 @@ pub const Buffer = struct {
         const limited = @min(radius, @min(r.w, r.h) / 2);
         const margin = limited + thickness + 2;
         const b = self.bounds(r);
-        for (b.y0..b.y1) |y| for (b.x0..b.x1) |x| {
-            const px = @as(f32, @floatFromInt(x)) + 0.5;
+        const lo: f32 = @floatFromInt(b.x0);
+        const hi: f32 = @floatFromInt(b.x1);
+        const left = std.math.clamp(@ceil(r.x + margin), lo, hi);
+        const right = std.math.clamp(@floor(r.x + r.w - margin), left, hi);
+        for (b.y0..b.y1) |y| {
             const py = @as(f32, @floatFromInt(y)) + 0.5;
 
-            // Most of it is inside, and nothing is drawn there.
-            if (px > r.x + margin and px < r.x + r.w - margin and
-                py > r.y + margin and py < r.y + r.h - margin) continue;
-            const d = distance(r, limited, px, py);
-            const outer = std.math.clamp(0.5 - d, 0, 1);
-            const inner = std.math.clamp(0.5 - (d + thickness), 0, 1);
-            self.blend(y * self.width + x, color, outer - inner);
-        };
+            // Between the corners it's the same all along a row, and none at
+            // all unless that's near the top or the bottom.
+            const along = if (py > r.y + margin and py < r.y + r.h - margin)
+                0
+            else
+                ringOf(distance(r, limited, r.x + r.w / 2, py), thickness);
+            const x0: usize = @intFromFloat(left);
+            const x1: usize = @intFromFloat(right);
+            for (b.x0..x0) |x| self.outlinePixel(r, limited, thickness, color, x, y, py);
+            if (along > 0) for (x0..x1) |x| self.blend(y * self.width + x, color, along);
+            for (x1..b.x1) |x| self.outlinePixel(r, limited, thickness, color, x, y, py);
+        }
+    }
+
+    fn outlinePixel(self: Buffer, r: Rect, radius: f32, thickness: f32, color: Rgb, x: usize, y: usize, py: f32) void {
+        const d = distance(r, radius, @as(f32, @floatFromInt(x)) + 0.5, py);
+        self.blend(y * self.width + x, color, ringOf(d, thickness));
+    }
+
+    /// How much of a pixel is in a line along the inside of an edge.
+    fn ringOf(d: f32, thickness: f32) f32 {
+        return std.math.clamp(0.5 - d, 0, 1) - std.math.clamp(0.5 - (d + thickness), 0, 1);
     }
 
     /// Light that's caught by the upper edge of a rounded rectangle. It's the

@@ -107,12 +107,9 @@ pub const Fit = struct {
     moving: bool = false,
 
     /// The largest the area could be. Drivers take long to resize what's drawn
-    /// to a window, so if it isn't large enough it's made this large, once. It's
-    /// cut off to the area.
+    /// to a window, so it's always this large, and cut off to the area.
     max_width: c_int = 0,
     max_height: c_int = 0,
-    target_width: c_int = 0,
-    target_height: c_int = 0,
 
     /// The size of the terminal follows the area, but only down to this, as
     /// one that's made very small loses the layout of its contents. What
@@ -165,6 +162,14 @@ fn createWith(
     const self = try alloc.create(Surface);
     errdefer alloc.destroy(self);
 
+    const area: c.SIZE = .{
+        .cx = @max(1, rect.right - rect.left - if (app.config.scrollbar == .system)
+            Scrollbar.width(window.getDpi())
+        else
+            0),
+        .cy = @max(1, rect.bottom - rect.top),
+    };
+    const max = window.maxPane();
     const hwnd = c.CreateWindowExW(
         0,
         App.surface_class,
@@ -172,11 +177,8 @@ fn createWith(
         c.WS_CHILD | c.WS_CLIPSIBLINGS,
         rect.left,
         rect.top,
-        @max(1, rect.right - rect.left - if (app.config.scrollbar == .system)
-            Scrollbar.width(window.getDpi())
-        else
-            0),
-        @max(1, rect.bottom - rect.top),
+        @max(area.cx, max.cx),
+        @max(area.cy, max.cy),
         window.hwnd,
         null,
         app.hinstance,
@@ -188,6 +190,7 @@ fn createWith(
         .app = app,
         .window = window,
         .hwnd = hwnd,
+        .area = area,
         .background = .init(window.background()),
         .cursor = c.LoadCursorW(null, c.IDC_IBEAM),
     };
@@ -296,7 +299,12 @@ pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
     return .{ .x = scale, .y = scale };
 }
 
+/// That of our area, which the window may be larger than.
 pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
+    if (self.area.cx > 0 and self.area.cy > 0) return .{
+        .width = @intCast(self.area.cx),
+        .height = @intCast(self.area.cy),
+    };
     var rect: c.RECT = .{};
     if (c.GetClientRect(self.hwnd, &rect) == 0) return error.Win32Failed;
     return .{ .width = @intCast(rect.right), .height = @intCast(rect.bottom) };
@@ -470,13 +478,10 @@ pub fn place(self: *Surface, area: c.RECT, fit: Fit) void {
     self.moving.store(fit.moving, .release);
     self.area = .{ .cx = width, .cy = height };
 
-    var window = self.area;
-    if (fit.moving) {
-        const now = self.windowSize();
-        const grows = fit.target_width - bar > now.cx or fit.target_height > now.cy;
-        window.cx = @max(window.cx, if (grows) @max(now.cx, fit.max_width) else now.cx);
-        window.cy = @max(window.cy, if (grows) @max(now.cy, fit.max_height) else now.cy);
-    }
+    const window: c.SIZE = .{
+        .cx = @max(width, fit.max_width),
+        .cy = @max(height, fit.max_height),
+    };
     _ = c.SetWindowPos(
         self.hwnd,
         null,
@@ -503,12 +508,6 @@ pub fn place(self: *Surface, area: c.RECT, fit: Fit) void {
     _ = self.moves.fetchAdd(1, .acq_rel);
     self.core_surface.refreshCallback() catch |err|
         log.warn("error refreshing surface err={}", .{err});
-}
-
-fn windowSize(self: *const Surface) c.SIZE {
-    var rect: c.RECT = .{};
-    _ = c.GetClientRect(self.hwnd, &rect);
-    return .{ .cx = rect.right, .cy = rect.bottom };
 }
 
 /// Whether what's shown was drawn since we last moved.

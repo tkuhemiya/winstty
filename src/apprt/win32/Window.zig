@@ -218,6 +218,9 @@ cards: std.ArrayList(Card) = .empty,
 /// How much of a card panes are, from filling the window to being one.
 card_amount: motion.Spring = .at(0),
 
+/// What's drawn of the window.
+back: ?paint.Back = null,
+
 /// How much of the side panel is in view.
 panel: motion.Spring = .at(0),
 /// Whether it has been shown or hidden by hand.
@@ -370,6 +373,7 @@ fn deinit(self: *Window) void {
     for (self.tabs.items) |*tab| tab.deinit(alloc);
     self.tabs.deinit(alloc);
     self.leaveSession();
+    if (self.back) |v| v.deinit();
     self.layout.deinit();
     self.placements.deinit(alloc);
     self.boundaries.deinit(alloc);
@@ -580,8 +584,8 @@ fn sameNode(
 
 /// Called when the connection is lost, or is back.
 pub fn titleOfSession(self: *Window) void {
-    self.updateTitle();
-    self.invalidateBar();
+    // There may be a title bar just for this.
+    self.refresh();
 }
 
 /// Called when what programs are doing has changed.
@@ -1241,10 +1245,20 @@ fn customFrame(self: *const Window) bool {
     return self.windowed == null and self.titlebarStyle() != .native;
 }
 
+/// Whether there's a title bar, of those that could have one. With tabs at the
+/// side there's nothing for it but the buttons, if they're shown, and to say
+/// that the server is gone.
+fn needsTitle(self: *const Window) bool {
+    if (!self.tabsAtSide()) return true;
+    if (self.app.config.@"macos-window-buttons" == .visible) return true;
+    const session = self.session orelse return false;
+    return session.lost;
+}
+
 /// The title bar if we're the one drawing it.
 fn titleRect(self: *const Window) c.RECT {
     var rect = self.clientRect();
-    rect.bottom = if (self.windowed != null) 0 else switch (self.titlebarStyle()) {
+    rect.bottom = if (self.windowed != null or !self.needsTitle()) 0 else switch (self.titlebarStyle()) {
         .native, .hidden => 0,
         // Tabs take the place of the title.
         .transparent => self.scaled(if (self.barVisible()) strip_height else title_height),
@@ -1492,6 +1506,8 @@ pub fn frame(self: *Window) bool {
 
     const style = self.app.motionStyle();
     const layout_moved = self.layoutMoving();
+    const panel_moved = self.panel.moving();
+    const cards_moved = self.card_amount.moving();
     _ = self.layout.step(style, elapsed);
     self.card_amount.step(style, elapsed);
     self.panel.step(style, elapsed);
@@ -1500,9 +1516,12 @@ pub fn frame(self: *Window) bool {
     for (self.tabs.items) |*tab| tab.row.step(style, elapsed);
 
     if (layout_moved and !self.minimized) {
+        // The bars have text that takes a while to draw, so not for each frame.
+        const bars = panel_moved or cards_moved or self.selection.moving();
         self.arrange();
         self.awaitPanes();
-        _ = c.InvalidateRect(self.hwnd, null, 0);
+        const content = self.contentRect();
+        _ = c.InvalidateRect(self.hwnd, if (bars) null else &content, 0);
     } else {
         self.invalidateBar();
     }
@@ -1695,9 +1714,9 @@ fn arrange(self: *Window) void {
     if (self.minimized) return;
     const tab = self.activeTab() orelse return;
     syncDimming(tab);
-    const content = self.contentRect();
+    const max = self.maxPane();
     self.layout.arrange(
-        self.cardsRect(content),
+        self.cardsRect(self.contentRect()),
         &self.placements,
         &self.boundaries,
     ) catch |err| {
@@ -1746,19 +1765,20 @@ fn arrange(self: *Window) void {
         }) catch {};
 
         const fit: Surface.Fit = fit: {
-            if (v.vanishing) break :fit .{ .moving = is_moving, .frozen = true };
-            if (!is_moving) break :fit .{};
+            if (v.vanishing) break :fit .{
+                .moving = is_moving,
+                .max_width = max.cx,
+                .max_height = max.cy,
+                .frozen = true,
+            };
+            if (!is_moving) break :fit .{ .max_width = max.cx, .max_height = max.cy };
             const target = insetRect(v.target, inset);
             const width = target.right - target.left;
             const height = target.bottom - target.top;
             break :fit .{
                 .moving = true,
-                // Of all there is, since what's divided grows as well when
-                // panes stop being cards.
-                .max_width = content.right - content.left,
-                .max_height = content.bottom - content.top,
-                .target_width = width,
-                .target_height = height,
+                .max_width = max.cx,
+                .max_height = max.cy,
                 // What appears is uncovered, as it already has its size.
                 .min_width = if (v.appearing) width else @min(width, self.scaled(moving_min_width)),
                 .min_height = if (v.appearing) height else @min(height, self.scaled(moving_min_height)),
@@ -1770,6 +1790,13 @@ fn arrange(self: *Window) void {
         if (!shown and is_moving and surface.visible) surface.cutOff() else surface.setVisible(shown);
     }
     self.repositionOverlays();
+}
+
+/// The largest a pane could be, or nothing if they don't move.
+pub fn maxPane(self: *const Window) c.SIZE {
+    if (self.app.motionStyle() == .off) return .{};
+    const client = self.clientRect();
+    return .{ .cx = client.right, .cy = client.bottom - self.barRect().bottom };
 }
 
 /// As much of a length as panes are cards.
@@ -2137,12 +2164,29 @@ fn onPaint(self: *Window) void {
     const dc = c.BeginPaint(self.hwnd, &ps) orelse return;
     defer _ = c.EndPaint(self.hwnd, &ps);
 
-    const palette: paint.Palette = .init(&self.app.config);
-    if (self.cardAmount() > 0 or self.layoutMoving()) self.paintCards(dc, palette);
-    self.paintPanel(dc, palette);
+    const client = self.clientRect();
+    if (self.back) |v| if (v.width != client.right or v.height != client.bottom) {
+        v.deinit();
+        self.back = null;
+    };
+    if (self.back == null) self.back = .init(dc, client.right, client.bottom);
+    const back = self.back orelse return;
 
+    // What isn't to be shown doesn't need to be drawn.
+    const palette: paint.Palette = .init(&self.app.config);
+    const content = self.contentRect();
+    if ((self.cardAmount() > 0 or self.layoutMoving()) and c.RectVisible(dc, &content) != 0) {
+        self.paintCards(back.dc, palette);
+    }
+    const panel = self.panelRect();
+    if (panel.right > 0 and c.RectVisible(dc, &panel) != 0) self.paintPanel(back.dc, palette);
     const bar = self.barRect();
-    if (bar.bottom == 0) return;
+    if (bar.bottom > 0 and c.RectVisible(dc, &bar) != 0) self.paintBar(back.dc, palette);
+    back.show(dc, ps.rcPaint);
+}
+
+fn paintBar(self: *Window, dc: c.HDC, palette: paint.Palette) void {
+    const bar = self.barRect();
     var buf = paint.Buffer.begin(dc, bar) orelse return;
     defer buf.end();
     self.paintBase(&buf, palette, .bar);
@@ -2441,6 +2485,18 @@ fn paintPanel(self: *Window, dc: c.HDC, palette: paint.Palette) void {
         buf.glass(.from(plus_at), radius, palette.fg, if (contrast) 0.3 else 0.1);
     }
     buf.blendText(paint.icon.add, plus_at, self.font_icon, palette.fg, 0.8 * strength, c.DT_CENTER);
+
+    // There's no title to have it beside.
+    if (self.titleRect().bottom == 0) {
+        const size = self.scaled(close_size);
+        const inset = @divTrunc(plus_at.bottom - plus_at.top - size, 2);
+        buf.statusMark(.{
+            .left = plus_at.right - inset - size,
+            .top = plus_at.top + inset,
+            .right = plus_at.right - inset,
+            .bottom = plus_at.bottom - inset,
+        }, self.elsewhereMark(), palette.fg, palette.bg, 1);
+    }
 
     // Between this and the terminal. Cards are their own.
     var line = move(panel, panel);

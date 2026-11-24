@@ -411,6 +411,13 @@ pub fn present(
         const dim = self.rt_surface.dim.load(.acquire);
         if (dim >> 24 > 0) {
             if (self.dimmer == null) self.dimmer = try .init();
+
+            // Over the frame, wherever that is on the screen.
+            const width: c_int = @intCast(target.width);
+            const height: c_int = @intCast(target.height);
+            try gl.viewport(0, bottom, width, height);
+            defer gl.viewport(0, 0, width, height) catch |err|
+                log.err("error restoring the viewport err={}", .{err});
             try self.dimmer.?.draw(
                 dim,
                 if (self.background()) |v| @as(f32, @floatFromInt(v.opacity)) / 255 else null,

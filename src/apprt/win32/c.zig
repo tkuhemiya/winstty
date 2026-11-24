@@ -394,6 +394,7 @@ pub extern "gdi32" fn SelectObject(HDC, HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 pub extern "gdi32" fn DeleteObject(HGDIOBJ) callconv(.winapi) BOOL;
 pub extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
 pub extern "gdi32" fn BitBlt(HDC, c_int, c_int, c_int, c_int, HDC, c_int, c_int, u32) callconv(.winapi) BOOL;
+pub extern "gdi32" fn RectVisible(HDC, *const RECT) callconv(.winapi) BOOL;
 pub extern "gdi32" fn CreateSolidBrush(COLORREF) callconv(.winapi) ?HGDIOBJ;
 pub extern "gdi32" fn SetBkMode(HDC, c_int) callconv(.winapi) c_int;
 pub extern "gdi32" fn SetTextColor(HDC, COLORREF) callconv(.winapi) COLORREF;
