@@ -301,6 +301,21 @@ pub const DWM_BLURBEHIND = extern struct {
     fTransitionOnMaximized: BOOL = 0,
 };
 
+pub const ACCENT_POLICY = extern struct {
+    state: u32,
+    flags: u32 = 0,
+    color: u32 = 0,
+    animation: u32 = 0,
+};
+pub const WINDOWCOMPOSITIONATTRIBDATA = extern struct {
+    attribute: u32,
+    data: *const anyopaque,
+    size: usize,
+};
+pub const WCA_ACCENT_POLICY = 19;
+pub const ACCENT_DISABLED = 0;
+pub const ACCENT_ENABLE_BLURBEHIND = 3;
+
 pub const CS_DBLCLKS = 0x8;
 pub const WS_CHILD: u32 = 0x40000000;
 pub const WS_POPUP: u32 = 0x80000000;
@@ -342,9 +357,13 @@ pub const DWMWA_TEXT_COLOR = 36;
 pub const DWMWA_SYSTEMBACKDROP_TYPE = 38;
 pub const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
 
+pub extern "kernel32" fn GetProcAddress(HINSTANCE, [*:0]const u8) callconv(.winapi) ?*anyopaque;
 pub extern "user32" fn BeginPaint(HWND, *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(HWND, *const PAINTSTRUCT) callconv(.winapi) BOOL;
 pub extern "user32" fn InvalidateRect(HWND, ?*const RECT, BOOL) callconv(.winapi) BOOL;
+pub const RDW_INVALIDATE = 0x1;
+pub const RDW_ALLCHILDREN = 0x80;
+pub extern "user32" fn RedrawWindow(HWND, ?*const RECT, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;

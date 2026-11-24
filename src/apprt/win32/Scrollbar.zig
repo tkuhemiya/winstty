@@ -113,7 +113,8 @@ fn onPaint(self: *Scrollbar) void {
     defer _ = c.EndPaint(self.hwnd, &ps);
     var rect: c.RECT = .{};
     _ = c.GetClientRect(self.hwnd, &rect);
-    const buf = paint.Buffer.begin(dc, rect) orelse return;
+    var buf = paint.Buffer.begin(dc, rect) orelse return;
+    buf.opacity = self.surface.window.backgroundOpacity();
     defer buf.end();
 
     const palette: paint.Palette = .init(&self.surface.app.config);

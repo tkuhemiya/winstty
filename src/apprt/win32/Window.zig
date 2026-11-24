@@ -779,13 +779,17 @@ pub fn configChanged(self: *Window) void {
     self.syncAppearance();
     for (self.tabs.items) |*tab| {
         var it = tab.tree.iterator();
-        while (it.next()) |entry| entry.view.configChanged();
+        while (it.next()) |entry| {
+            entry.view.configChanged();
+            if (self.force_opaque) entry.view.updateOpacity();
+        }
     }
     self.refresh();
 }
 
 /// Match the frame to the configured theme.
 fn syncAppearance(self: *Window) void {
+    self.syncTransparency();
     const config = &self.app.config;
     const palette: paint.Palette = .init(config);
     const dark: c.BOOL = @intFromBool(switch (config.@"window-theme") {
@@ -809,6 +813,65 @@ fn syncAppearance(self: *Window) void {
     }
     _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_CAPTION_COLOR, &caption, @sizeOf(u32));
     _ = c.DwmSetWindowAttribute(self.hwnd, c.DWMWA_TEXT_COLOR, &caption_text, @sizeOf(u32));
+}
+
+/// The opacity (0 to 255) of the terminal background.
+pub fn backgroundOpacity(self: *const Window) u8 {
+    if (self.force_opaque) return 255;
+    return @intFromFloat(@round(std.math.clamp(self.app.config.@"background-opacity", 0, 1) * 255));
+}
+
+pub fn toggleOpacity(self: *Window) bool {
+    if (self.app.config.@"background-opacity" >= 1) return false;
+    self.force_opaque = !self.force_opaque;
+    self.syncTransparency();
+
+    for (self.tabs.items) |*tab| {
+        var it = tab.tree.iterator();
+        while (it.next()) |entry| entry.view.updateOpacity();
+    }
+    _ = c.RedrawWindow(self.hwnd, null, null, c.RDW_INVALIDATE | c.RDW_ALLCHILDREN);
+    return true;
+}
+
+/// Have the compositor use the alpha channel of what's drawn, or not.
+fn syncTransparency(self: *Window) void {
+    const transparent = self.backgroundOpacity() < 255;
+
+    // An empty region enables alpha without any blur. Since Windows 8 the
+    // blur this is named for doesn't exist anyway.
+    const region = if (transparent) c.CreateRectRgn(0, 0, -1, -1) else null;
+    defer if (region) |v| {
+        _ = c.DeleteObject(v);
+    };
+    _ = c.DwmEnableBlurBehindWindow(self.hwnd, &.{
+        .dwFlags = c.DWM_BB_ENABLE | @as(u32, if (transparent) c.DWM_BB_BLURREGION else 0),
+        .fEnable = @intFromBool(transparent),
+        .hRgnBlur = region,
+    });
+
+    // The documented backdrops (DWMWA_SYSTEMBACKDROP_TYPE) are opaque
+    // materials that don't show what's behind the window. This is
+    // undocumented, so look it up and do without if it's ever removed.
+    const blur = transparent and switch (self.app.config.@"background-blur") {
+        .false => false,
+        .radius => |v| v > 0,
+        .true, .@"macos-glass-regular", .@"macos-glass-clear" => true,
+    };
+    const user32 = c.GetModuleHandleW(c.L("user32.dll")) orelse return;
+    const proc = c.GetProcAddress(user32, "SetWindowCompositionAttribute") orelse return;
+    const func: *const fn (
+        c.HWND,
+        *const c.WINDOWCOMPOSITIONATTRIBDATA,
+    ) callconv(.winapi) c.BOOL = @ptrCast(@alignCast(proc));
+    const policy: c.ACCENT_POLICY = .{
+        .state = if (blur) c.ACCENT_ENABLE_BLURBEHIND else c.ACCENT_DISABLED,
+    };
+    _ = func(self.hwnd, &.{
+        .attribute = c.WCA_ACCENT_POLICY,
+        .data = &policy,
+        .size = @sizeOf(c.ACCENT_POLICY),
+    });
 }
 
 fn updateFont(self: *Window) void {
@@ -840,7 +903,8 @@ fn onPaint(self: *Window) void {
 
     const palette: paint.Palette = .init(&self.app.config);
     for (self.dividers.items) |divider| {
-        const buf = paint.Buffer.begin(dc, divider.rect) orelse continue;
+        var buf = paint.Buffer.begin(dc, divider.rect) orelse continue;
+        buf.opacity = self.backgroundOpacity();
         defer buf.end();
         const r = divider.rect;
         var line: c.RECT = .{ .right = r.right - r.left, .bottom = r.bottom - r.top };

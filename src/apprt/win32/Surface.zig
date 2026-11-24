@@ -102,6 +102,7 @@ pub fn create(
 
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
+    if (window.force_opaque) config.@"background-opacity" = 1;
     if (app.config.@"window-inherit-font-size") {
         if (parent) |v| config.@"font-size" = v.core_surface.font_size.points;
     }
@@ -339,6 +340,15 @@ pub fn place(self: *Surface, area: c.RECT) void {
 pub fn configChanged(self: *Surface) void {
     self.syncScrollbar() catch |err| log.warn("error creating scrollbar err={}", .{err});
     if (self.scrollbar) |v| v.invalidate();
+}
+
+/// The background is drawn premultiplied, so it must be redrawn to be opaque.
+pub fn updateOpacity(self: *Surface) void {
+    var config = self.app.config.shallowClone(self.app.core_app.alloc);
+    defer config.deinit();
+    if (self.window.force_opaque) config.@"background-opacity" = 1;
+    self.core_surface.updateConfig(&config) catch |err|
+        log.warn("error updating opacity err={}", .{err});
 }
 
 pub fn scrollbarWidth(self: *const Surface) c_int {

@@ -330,6 +330,7 @@ pub fn performAction(
         .set_tab_title => return try (surface orelse return false).window.setTabTitle(surface.?, value.title),
         .set_window_title => try (surface orelse return false).window.setWindowTitle(value.title),
         .toggle_fullscreen => (surface orelse return false).window.toggleFullscreen(),
+        .toggle_background_opacity => return (surface orelse return false).window.toggleOpacity(),
         .toggle_maximize => (surface orelse return false).window.toggleMaximize(),
         .mouse_shape => (surface orelse return false).setMouseShape(value),
         .mouse_visibility => (surface orelse return false).setMouseVisible(value == .visible),

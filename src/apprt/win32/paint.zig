@@ -103,6 +103,9 @@ pub const Buffer = struct {
     previous: ?c.HGDIOBJ,
     pixels: []u32,
 
+    /// Less than 255 shows what's behind a window with per-pixel alpha.
+    opacity: u8 = 255,
+
     /// Coordinates drawn to `dc` are relative to the rect's origin.
     pub fn begin(target: c.HDC, rect: c.RECT) ?Buffer {
         const width = rect.right - rect.left;
@@ -131,7 +134,18 @@ pub const Buffer = struct {
 
     pub fn end(self: Buffer) void {
         _ = c.GdiFlush();
-        for (self.pixels) |*pixel| pixel.* |= 0xFF000000;
+        if (self.opacity == 255) {
+            for (self.pixels) |*pixel| pixel.* |= 0xFF000000;
+        } else {
+            const table = premultiplied(self.opacity);
+            for (self.pixels) |*pixel| {
+                const p = pixel.*;
+                pixel.* = @as(u32, self.opacity) << 24 |
+                    @as(u32, table[(p >> 16) & 0xFF]) << 16 |
+                    @as(u32, table[(p >> 8) & 0xFF]) << 8 |
+                    table[p & 0xFF];
+            }
+        }
         _ = c.BitBlt(
             self.target,
             self.rect.left,
@@ -146,6 +160,26 @@ pub const Buffer = struct {
         if (self.previous) |v| _ = c.SelectObject(self.dc, v);
         _ = c.DeleteObject(self.bitmap);
         _ = c.DeleteDC(self.dc);
+    }
+
+    /// Premultiplies in linear space, as the terminal's renderer does, so that
+    /// the same color next to it looks the same.
+    fn premultiplied(opacity: u8) [256]u8 {
+        const alpha = @as(f32, @floatFromInt(opacity)) / 255;
+        var table: [256]u8 = undefined;
+        for (&table, 0..) |*v, i| {
+            const srgb = @as(f32, @floatFromInt(i)) / 255;
+            const linear = alpha * if (srgb <= 0.04045)
+                srgb / 12.92
+            else
+                std.math.pow(f32, (srgb + 0.055) / 1.055, 2.4);
+            const encoded = if (linear <= 0.0031308)
+                linear * 12.92
+            else
+                1.055 * std.math.pow(f32, linear, 1.0 / 2.4) - 0.055;
+            v.* = @intFromFloat(@round(std.math.clamp(encoded, 0, 1) * 255));
+        }
+        return table;
     }
 
     pub fn fill(self: Buffer, rect: c.RECT, color: Rgb) void {
