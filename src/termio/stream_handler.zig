@@ -59,6 +59,9 @@ pub const StreamHandler = struct {
     /// and XTCHECKSUM may change how it's calculated.
     xt_checksum_report: bool,
 
+    /// Whether what programs ask of the terminal is for us to answer.
+    replies: bool = true,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -139,6 +142,18 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (!self.replies) switch (msg) {
+            // These are to be answered, or to do something to a window that
+            // isn't the only one to show this.
+            .report_title,
+            .clipboard_read,
+            .resize_window,
+            => return,
+            .kitty_clipboard_read => |v| return v.destroy(),
+            .kitty_clipboard_write => |v| return v.destroy(),
+            else => {},
+        };
+
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -149,6 +164,10 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (!self.replies) switch (msg) {
+            .start_synchronized_output, .linefeed_mode => {},
+            else => return msg.deinit(),
+        };
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

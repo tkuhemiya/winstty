@@ -1489,6 +1489,17 @@ scrollbar: Scrollbar = .system,
 ///   * `top` - A bar in the title bar.
 @"win32-tab-bar": Win32TabBar = .side,
 
+/// Show the sessions of the Rex server of this machine, rather than terminals
+/// of our own. What runs in them keeps running when the window is closed.
+///
+/// Rex Server has to be installed. It's started if it isn't running.
+///
+/// This applies to windows that are opened from then on. Turning it off ends
+/// nothing that's on the server.
+///
+/// This is only supported on Windows.
+@"win32-rex": bool = false,
+
 /// How splits, the side panel and the selection move on Windows.
 ///
 /// Valid values:

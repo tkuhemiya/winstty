@@ -684,8 +684,17 @@ pub fn init(
             break :termio_env env;
         };
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
+        // Initialize our IO backend. The apprt may have one that isn't a
+        // command of ours.
+        var backend: termio.Backend = if (if (comptime @hasDecl(apprt.Surface, "takeBackend"))
+            rt_surface.takeBackend()
+        else
+            null) |v|
+        backend: {
+            var unused = env;
+            unused.deinit();
+            break :backend v;
+        } else .{ .exec = try termio.Exec.init(alloc, .{
             .command = command,
             .env = env,
             .env_override = config.env,
@@ -697,8 +706,8 @@ pub fn init(
             .term = config.term,
             .rt_pre_exec_info = .init(config),
             .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        }) };
+        errdefer backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -712,7 +721,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = io_config,
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = &self.renderer_thread.wakeup,
@@ -1386,6 +1395,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .rex => &.{},
     });
     const runtime_str = try alloc.print("{d} ms", .{info.runtime_ms});
 
@@ -5054,6 +5064,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
+            if (self.io.backend.reset()) return true;
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.terminal.fullReset();

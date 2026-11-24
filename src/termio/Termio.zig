@@ -325,9 +325,11 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
         .xt_checksum_report = opts.config.xt_checksum_report,
+        .replies = !backend.isRemote(),
     };
 
-    const thread_enter_state = try ThreadEnterState.create(
+    // The input is for what we start.
+    const thread_enter_state = if (backend.isRemote()) null else try ThreadEnterState.create(
         alloc,
         opts.full_config,
     );
@@ -530,14 +532,18 @@ pub fn resize(
     const grid_size = size.grid();
 
     // Enter the critical area that we want to keep small
-    {
+    resize: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
         // Resizing the pty can immediately wake the shell with SIGWINCH.
         // Hold the same lock used by processOutput before notifying it, so
         // its redraw cannot be parsed against the old terminal dimensions.
+        self.backend.setCell(size.cell);
         try self.backend.resize(grid_size, size.terminal());
+
+        // We're told when it has changed.
+        if (self.backend.isRemote()) break :resize;
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -571,6 +577,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.backend.isRemote()) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -603,6 +610,7 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    if (self.backend.clear()) return;
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -783,6 +791,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.backend.isRemote()) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
@@ -805,6 +814,7 @@ pub fn visibilityReport(
     visible: bool,
     force: bool,
 ) !void {
+    if (self.backend.isRemote()) return;
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
