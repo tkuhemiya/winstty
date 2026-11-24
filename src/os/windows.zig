@@ -108,6 +108,7 @@ pub const S_OK = 0;
 pub const SYNCHRONIZE = 0x00100000;
 pub const VOLUME_NAME_DOS = 0x0;
 pub const WAIT_FAILED = 0xFFFFFFFF;
+pub const WAIT_TIMEOUT = 258;
 
 /// IOCTL that fills the output buffer with bytes from the kernel CSPRNG
 /// behind `\Device\CNG` (what ProcessPrng and BCryptGenRandom draw from).
@@ -265,6 +266,13 @@ pub const exp = struct {
             lpBuffer: LPVOID,
             nNumberOfBytesToRead: DWORD,
             lpNumberOfBytesRead: ?*DWORD,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: [*]const u8,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: ?*DWORD,
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew

@@ -19,7 +19,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .optimize = cfg.optimize,
             .strip = cfg.strip,
             .omit_frame_pointer = cfg.omitFramePointer(),
-            .unwind_tables = if (cfg.strip) .none else .sync,
+            // Windows uses these for SEH, including in the C runtime, so they
+            // are needed even when there is no debug info to go with them.
+            .unwind_tables = if (cfg.strip and cfg.target.result.os.tag != .windows)
+                .none
+            else
+                .sync,
         }),
         // Crashes on x86_64 self-hosted on 0.15.1
         .use_llvm = true,

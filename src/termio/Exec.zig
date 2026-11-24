@@ -123,8 +123,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer internal_os.closePipe(pipe[0]);
+    errdefer internal_os.closePipe(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -203,6 +203,11 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
+    if (comptime builtin.target.os.tag == .windows) {
+        quitReadThreadWindows(exec);
+        return;
+    }
+
     switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
@@ -216,14 +221,28 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
         ),
     }
 
-    if (comptime builtin.target.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
+    exec.read_thread.join();
+}
+
+fn quitReadThreadWindows(exec: anytype) void {
+    // This fails if the read thread is already gone, which is fine.
+    _ = windows.exp.kernel32.WriteFile(exec.read_thread_pipe, "x", 1, null, null);
+
+    // Interrupt the blocking read so the thread can see the quit message. The
+    // cancel only affects a read that is in progress, and the thread may be
+    // just about to start one, so repeat it until the thread is gone.
+    while (true) {
         if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
             switch (windows.GetLastError()) {
                 .NOT_FOUND => {},
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
             }
         }
+
+        if (windows.exp.kernel32.WaitForSingleObject(
+            exec.read_thread.getHandle(),
+            10,
+        ) != windows.WAIT_TIMEOUT) break;
     }
 
     exec.read_thread.join();
@@ -547,7 +566,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        internal_os.closePipe(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -585,7 +604,7 @@ pub const Config = struct {
 };
 
 const Subprocess = struct {
-    const c = @import("posix_c");
+    const c = if (builtin.target.os.tag != .windows) @import("posix_c") else struct {};
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
@@ -1105,7 +1124,21 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.closeProcess();
         self.process = null;
+    }
+
+    /// Close the process handle. Only Windows has one. Elsewhere, the pid is
+    /// just a number.
+    fn closeProcess(self: *Subprocess) void {
+        if (comptime builtin.target.os.tag != .windows) return;
+        switch (self.process orelse return) {
+            .fork_exec => |*cmd| if (cmd.pid) |handle| {
+                _ = windows.exp.kernel32.CloseHandle(handle);
+                cmd.pid = null;
+            },
+            .flatpak => {},
+        }
     }
 
     /// Stop the subprocess. This is safe to call anytime. This will wait
@@ -1129,6 +1162,7 @@ const Subprocess = struct {
             },
         }
 
+        self.closeProcess();
         self.process = null;
     }
 
@@ -1777,7 +1811,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer internal_os.closePipe(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1795,6 +1829,13 @@ pub const ReadThread = struct {
                     switch (err) {
                         // Check for a quit signal
                         .OPERATION_ABORTED => break,
+
+                        // ConPTY closed its end, so there is nothing left
+                        // to read. This is normal when the session ends.
+                        .BROKEN_PIPE => {
+                            log.info("pty closed, read thread exiting", .{});
+                            return;
+                        },
 
                         else => {
                             log.err("io reader error err={}", .{err});
@@ -2000,11 +2041,11 @@ fn execCommand(
                             try alloc.dupe(u8, v)
                     else
                         try alloc.dupe(u8, v);
-                    try args.append(alloc, try alloc.dupeSentinel(u8, argv0), 0);
+                    try args.append(alloc, try alloc.dupeSentinel(u8, argv0, 0));
                 } else {
                     var it = std.mem.tokenizeAny(u8, v, " \t");
                     while (it.next()) |tok| {
-                        try args.append(alloc, try alloc.dupeSentinel(u8, tok), 0);
+                        try args.append(alloc, try alloc.dupeSentinel(u8, tok, 0));
                     }
                 }
                 break :shell try args.toOwnedSlice(alloc);
