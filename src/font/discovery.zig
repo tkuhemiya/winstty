@@ -1039,9 +1039,28 @@ pub const Windows = struct {
         system_path: ?[:0]const u8,
         user_path: ?[:0]const u8,
 
+        /// The faces of the requested family, best match first. Null until
+        /// they've been searched for.
+        candidates: ?std.ArrayList(Candidate) = null,
+        candidate_idx: usize = 0,
+
+        const Candidate = struct {
+            face: DeferredFace,
+            score: u32,
+
+            fn lessThan(_: void, a: Candidate, b: Candidate) bool {
+                return a.score < b.score;
+            }
+        };
+
         const State = enum { system, user, done };
 
         pub fn deinit(self: *DiscoverIterator) void {
+            if (self.candidates) |*v| {
+                // Faces that were returned belong to the caller.
+                for (v.items[self.candidate_idx..]) |*item| item.face.deinit();
+                v.deinit(self.alloc);
+            }
             if (self.dir) |*d| d.close(global.io());
             if (self.system_path) |p| self.alloc.free(p);
             if (self.user_path) |p| self.alloc.free(p);
@@ -1049,6 +1068,59 @@ pub const Windows = struct {
         }
 
         pub fn next(self: *DiscoverIterator) !?DeferredFace {
+            // A codepoint search takes whatever has the codepoint first, since
+            // opening every font to find the best would be slow.
+            if (self.desc.family == null) return try self.scan();
+
+            if (self.candidates == null) {
+                // A family has a file for each style, in no useful order, so
+                // all of them have to be compared.
+                self.candidates = .empty;
+                while (try self.scan()) |v| {
+                    var face = v;
+                    errdefer face.deinit();
+                    try self.candidates.?.append(self.alloc, .{
+                        .face = face,
+                        .score = score(self.desc, &face.win.?.peek) orelse {
+                            face.deinit();
+                            continue;
+                        },
+                    });
+                }
+                std.mem.sort(Candidate, self.candidates.?.items, {}, Candidate.lessThan);
+            }
+
+            const items = self.candidates.?.items;
+            if (self.candidate_idx >= items.len) return null;
+            defer self.candidate_idx += 1;
+            return items[self.candidate_idx].face;
+        }
+
+        /// How far a face is from what was asked for, or null if it won't do.
+        /// A face without a requested trait won't do, because the collection
+        /// can synthesize it, or fall back to another family.
+        fn score(desc: Descriptor, face: *const Face) ?u32 {
+            const handle = face.face.handle;
+            const os2 = face.face.getSfntTable(.os2);
+            const weight: i32 = if (os2) |v| v.usWeightClass else 400;
+            const flags = handle.*.style_flags;
+            const italic = flags & 1 != 0;
+            const bold = flags & 2 != 0 or weight >= 600;
+            if (desc.bold and !bold) return null;
+            if (desc.italic and !italic) return null;
+
+            var result: u32 = @abs(weight - @as(i32, if (desc.bold) 700 else 400));
+            if (italic != desc.italic) result += 10_000;
+            if (bold != desc.bold) result += 10_000;
+            if (desc.style) |style| {
+                const name: ?[*:0]const u8 = handle.*.style_name;
+                const same = if (name) |v| std.ascii.eqlIgnoreCase(std.mem.span(v), style) else false;
+                if (!same) result += 100_000;
+            }
+            return result;
+        }
+
+        fn scan(self: *DiscoverIterator) !?DeferredFace {
             while (true) {
                 // Ensure we have a directory iterator for the current state.
                 if (self.iter == null) {
@@ -1439,4 +1511,34 @@ test "windows" {
     var face = (try it.next()) orelse return error.TestFontNotFound;
     defer face.deinit();
     try testing.expect(face.hasCodepoint('A', null));
+}
+
+test "windows styles" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var win = Windows.init(lib);
+    defer win.deinit();
+
+    // Arial has a file for each of these.
+    for ([_]bool{ false, true }) |bold| for ([_]bool{ false, true }) |italic| {
+        var it = try win.discover(alloc, .{
+            .family = "Arial",
+            .size = 12,
+            .bold = bold,
+            .italic = italic,
+        });
+        defer it.deinit();
+
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        const flags = face.win.?.peek.face.handle.*.style_flags;
+        try testing.expectEqual(italic, flags & 1 != 0);
+        try testing.expectEqual(bold, flags & 2 != 0);
+    };
 }
