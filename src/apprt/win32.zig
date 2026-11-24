@@ -9,8 +9,10 @@ pub const resourcesDir = internal_os.resourcesDir;
 
 test {
     _ = App;
+    _ = @import("../rex/main.zig");
     _ = Surface;
     _ = @import("win32/CommandPalette.zig");
+    _ = @import("win32/Session.zig");
     _ = @import("win32/glass.zig");
     _ = @import("win32/layout.zig");
     _ = @import("win32/motion.zig");

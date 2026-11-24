@@ -9,6 +9,7 @@ const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const InspectorWindow = @import("InspectorWindow.zig");
 const Outline = @import("Outline.zig");
+const Session = @import("Session.zig");
 const Scrollbar = @import("Scrollbar.zig");
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
@@ -17,7 +18,9 @@ const Ticker = @import("Ticker.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
 const glass = @import("glass.zig");
+const global = @import("../../global.zig");
 const motion = @import("motion.zig");
+const rex = @import("../../rex/main.zig");
 const themes = @import("themes.zig");
 
 const log = std.log.scoped(.win32);
@@ -32,6 +35,12 @@ const WM_WAKEUP = c.WM_APP + 1;
 const WM_QUIT_APP = c.WM_APP + 2;
 /// Posted to the message-only window for each frame of animation.
 const WM_TICK = c.WM_APP + 3;
+/// Posted to the message-only window with a `Posted`.
+const WM_POSTED = c.WM_APP + 4;
+/// Posted to the message-only window when a client has something to take.
+const WM_CLIENT = c.WM_APP + 5;
+/// Posted to the message-only window when a stream has ended.
+const WM_STREAM_ENDED = c.WM_APP + 6;
 
 core_app: *CoreApp,
 config: Config,
@@ -146,7 +155,7 @@ pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
 }
 
 pub fn run(self: *App) !void {
-    _ = try Window.create(self);
+    try self.openWindow(.last);
 
     var msg: c.MSG = undefined;
     while (true) {
@@ -173,6 +182,14 @@ pub fn terminate(self: *App) void {
     if (self.shell_override) |v| self.core_app.alloc.free(v);
     self.ticker.deinit();
     _ = c.CloseHandle(self.presented);
+
+    // What other threads had for us.
+    var msg: c.MSG = undefined;
+    while (c.PeekMessageW(&msg, self.hwnd, WM_POSTED, WM_POSTED, c.PM_REMOVE) != 0) {
+        const posted: *Posted = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
+        posted.deinit(self.core_app.alloc);
+        self.core_app.alloc.destroy(posted);
+    }
     _ = c.DestroyWindow(self.hwnd);
     self.windows.deinit(self.core_app.alloc);
     self.config.deinit();
@@ -200,8 +217,24 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
 
         WM_TICK => self.tick(),
 
+        WM_POSTED => {
+            const posted: *Posted = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const value = posted.*;
+            self.core_app.alloc.destroy(posted);
+            self.handlePosted(value);
+        },
+        WM_CLIENT => for (self.windows.items) |window| {
+            if (window.session) |v| v.receive();
+        },
+        WM_STREAM_ENDED => for (self.windows.items) |window| {
+            if (window.session) |v| v.streamsEnded();
+        },
+
         WM_QUIT_APP => if (!self.quitting and self.modal == 0) {
-            if (self.core_app.needsConfirmQuit() and !self.confirm(
+            const needs_confirm = for (self.windows.items) |window| {
+                if (window.needsConfirm()) break true;
+            } else false;
+            if (needs_confirm and !self.confirm(
                 null,
                 c.L("Quit Ghostty?"),
                 c.L("All terminal sessions will be terminated."),
@@ -213,6 +246,249 @@ fn wndProc(hwnd: c.HWND, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) callconv(
         else => return c.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     return 0;
+}
+
+//---------------------------------------------------------------
+// Rex
+
+/// What other threads have us do.
+pub const Posted = union(enum) {
+    connected: *Connecting,
+    opened: *Session.Opened,
+    failed: struct { window: ?c.HWND, err: anyerror },
+    tell: struct { window: c.HWND, title: [*:0]const u16, text: [:0]u16 },
+
+    fn deinit(self: Posted, alloc: Allocator) void {
+        switch (self) {
+            .connected => |v| v.destroy(),
+            .opened => |v| v.destroy(),
+            .failed => {},
+            .tell => |v| alloc.free(v.text),
+        }
+    }
+};
+
+/// A connection on its way, for a new window, or for one that lost its own.
+pub const Connecting = struct {
+    app: *App,
+    alloc: Allocator,
+    target: Session.Target,
+    window: ?c.HWND,
+    delay_ms: u32,
+    path_buf: [260:0]u16 = undefined,
+    path: [:0]const u16 = undefined,
+    result: anyerror!*rex.Client = error.Unexpected,
+
+    fn run(self: *Connecting) void {
+        if (self.delay_ms > 0) c.Sleep(self.delay_ms);
+        self.result = self.connect();
+        self.app.post(.{ .connected = self });
+    }
+
+    fn connect(self: *Connecting) !*rex.Client {
+        self.path = try rex.launch.path(self.alloc, &self.path_buf);
+        return try rex.Client.connect(self.alloc, self.path, .{
+            .context = self.app,
+            .func = clientNotified,
+        });
+    }
+
+    fn destroy(self: *Connecting) void {
+        self.target.deinit(self.alloc);
+        if (self.result) |v| v.leave() else |_| {}
+        self.alloc.destroy(self);
+    }
+};
+
+/// From any thread.
+pub fn post(self: *App, value: Posted) void {
+    const alloc = self.core_app.alloc;
+    const posted = alloc.create(Posted) catch return;
+    posted.* = value;
+    if (c.PostMessageW(self.hwnd, WM_POSTED, 0, @bitCast(@intFromPtr(posted))) != 0) return;
+
+    // We're gone.
+    alloc.destroy(posted);
+    value.deinit(alloc);
+}
+
+fn clientNotified(context: *anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(context));
+    _ = c.PostMessageW(self.hwnd, WM_CLIENT, 0, 0);
+}
+
+pub fn streamEnded(context: *anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(context));
+    _ = c.PostMessageW(self.hwnd, WM_STREAM_ENDED, 0, 0);
+}
+
+fn windowOf(self: *const App, hwnd: ?c.HWND) ?*Window {
+    const v = hwnd orelse return null;
+    for (self.windows.items) |window| if (window.hwnd == v) return window;
+    return null;
+}
+
+fn handlePosted(self: *App, value: Posted) void {
+    switch (value) {
+        .connected => |job| self.connected(job),
+        .opened => |job| {
+            defer job.destroy();
+            const window = self.windowOf(job.window) orelse return;
+            const session = window.session orelse return;
+            if (session.client == job.client) session.opened(job);
+        },
+        .failed => |v| self.rexFailed(v.window, v.err),
+        .tell => |v| {
+            defer self.core_app.alloc.free(v.text);
+            if (self.modal > 0) return;
+            self.modal += 1;
+            _ = c.MessageBoxW(v.window, v.text, v.title, c.MB_ICONWARNING);
+            self.modal -= 1;
+            self.modalClosed();
+        },
+    }
+}
+
+/// A window on a session, or a terminal of our own, as configured.
+pub fn openWindow(self: *App, target: Session.Target) !void {
+    if (!self.config.@"win32-rex") {
+        _ = try Window.create(self);
+        return;
+    }
+    const copy = try target.dupe(self.core_app.alloc);
+    errdefer copy.deinit(self.core_app.alloc);
+    try self.connectRex(copy, null);
+}
+
+/// Takes over the target if this doesn't fail.
+pub fn connectRex(self: *App, target: Session.Target, window: ?c.HWND) !void {
+    try self.connectRexIn(target, window, 0);
+}
+
+fn connectRexIn(self: *App, target: Session.Target, window: ?c.HWND, delay_ms: u32) !void {
+    const alloc = self.core_app.alloc;
+    const job = try alloc.create(Connecting);
+    errdefer alloc.destroy(job);
+    job.* = .{
+        .app = self,
+        .alloc = alloc,
+        .target = target,
+        .window = window,
+        .delay_ms = delay_ms,
+    };
+    const thread = try std.Thread.spawn(.{}, Connecting.run, .{job});
+    thread.detach();
+}
+
+fn connected(self: *App, job: *Connecting) void {
+    defer job.destroy();
+    if (self.quitting) return;
+    const client = job.result catch |err| {
+        log.warn("error connecting to the server err={}", .{err});
+        const window = self.windowOf(job.window);
+        if (job.window != null and window == null) return;
+        if (window) |v| if (v.session) |session| {
+            // The server may be about to be back.
+            const max_reconnects = 10;
+            const reconnect_ms = 1000;
+            session.reconnects += 1;
+            if (session.reconnects < max_reconnects) {
+                const target = job.target;
+                job.target = .last;
+                self.connectRexIn(target, job.window, reconnect_ms) catch target.deinit(self.core_app.alloc);
+                return;
+            }
+        };
+        return self.rexFailed(job.window, err);
+    };
+    const target = job.target;
+    if (job.window) |hwnd| {
+        const window = self.windowOf(hwnd) orelse return;
+        const session = window.session orelse return;
+        job.result = error.Taken;
+        job.target = .last;
+        session.@"resume"(client, job.path, target);
+        return;
+    }
+    Window.createFor(self, client, job.path, target) catch |err| {
+        log.warn("error creating a window err={}", .{err});
+        return;
+    };
+    job.result = error.Taken;
+    job.target = .last;
+}
+
+/// There's no server to show anything of, and the user should know why.
+fn rexFailed(self: *App, hwnd: ?c.HWND, err: anyerror) void {
+    @setEvalBranchQuota(20_000);
+    const why: [*:0]const u16 = switch (err) {
+        error.NotInstalled => c.L("Rex Server isn't installed. To install it, run:\n\n" ++
+            "winget source add --name rex --arg https://pkgs.superlogical.com/rex/winget --type Microsoft.Rest --explicit\n" ++
+            "winget install Superlogical.RexServer.Preview --source rex\n\n" ++
+            "Or set win32-rex to false, to go without it.\n\n" ++
+            "Open a local terminal now?"),
+        error.NotLocal => c.L("The Rex server isn't on this machine, and winstty only connects to one that is.\n\n" ++
+            "Open a local terminal now?"),
+        error.StartFailed => c.L("The Rex server couldn't be started.\n\n" ++
+            "Open a local terminal now?"),
+        else => c.L("The Rex server can't be reached.\n\n" ++
+            "Open a local terminal now?"),
+    };
+    log.warn("there's no server to use err={}", .{err});
+    if (self.modal > 0) return;
+    const local = self.confirm(hwnd, c.L("Rex"), why);
+    if (local) _ = Window.create(self) catch |e| log.warn("error creating a window err={}", .{e});
+    if (self.windowOf(hwnd)) |window| window.destroy();
+    if (self.windows.items.len == 0) c.PostQuitMessage(1);
+}
+
+/// Say something, once we're done with what we're doing.
+pub fn tell(self: *App, window: c.HWND, comptime title: []const u8, text: []const u8) void {
+    const alloc = self.core_app.alloc;
+    const wide = std.unicode.wtf8ToWtf16LeAllocZ(alloc, text) catch return;
+    self.post(.{ .tell = .{ .window = window, .title = c.L(title), .text = wide } });
+}
+
+const last_session_name = "rex-session";
+const max_last_session = 256;
+
+fn lastSessionPath(self: *App) ![]u8 {
+    const alloc = self.core_app.alloc;
+    const config = try configpkg.preferredDefaultFilePath(alloc);
+    defer alloc.free(config);
+    const dir = std.fs.path.dirname(config) orelse return error.NoDirectory;
+    return try std.fs.path.join(alloc, &.{ dir, last_session_name });
+}
+
+/// The session that was last shown. The caller owns it.
+pub fn lastSession(self: *App) !?[]u8 {
+    const alloc = self.core_app.alloc;
+    const path = self.lastSessionPath() catch return null;
+    defer alloc.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(
+        global.io(),
+        path,
+        alloc,
+        .limited(max_last_session),
+    ) catch null;
+}
+
+pub fn setLastSession(self: *App, id: []const u8) void {
+    self.writeLastSession(id) catch |err|
+        log.info("error remembering the session err={}", .{err});
+}
+
+fn writeLastSession(self: *App, id: []const u8) !void {
+    const path = try self.lastSessionPath();
+    defer self.core_app.alloc.free(path);
+    const io = global.io();
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var buf: [max_last_session]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(id);
+    try writer.interface.flush();
 }
 
 /// A frame of animation.
@@ -297,14 +573,17 @@ pub fn confirm(
     self.modal += 1;
     const result = c.MessageBoxW(owner, text, title, c.MB_OKCANCEL | c.MB_ICONWARNING);
     self.modal -= 1;
+    self.modalClosed();
+    return result == c.IDOK;
+}
 
+fn modalClosed(self: *App) void {
     // Surfaces that wanted to close can, now.
     if (self.modal == 0) for (self.core_app.surfaces.items) |surface| {
         if (!surface.close_pending) continue;
         surface.close_pending = false;
         surface.close(false);
     };
-    return result == c.IDOK;
 }
 
 pub fn colorSchemeChanged(self: *App) !void {
@@ -356,14 +635,14 @@ pub fn performAction(
             .stop => {},
         },
 
-        .new_window => _ = try Window.create(self),
+        .new_window => try self.openWindow(.new),
 
         .new_tab => {
             const v = surface orelse {
-                _ = try Window.create(self);
+                try self.openWindow(.new);
                 return true;
             };
-            _ = try v.window.newTab(.tab);
+            try v.window.openTab();
         },
         .close_tab => return (surface orelse return false).window.requestCloseTab(surface.?, value),
         .goto_tab => return (surface orelse return false).window.gotoTab(value),

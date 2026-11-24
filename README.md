@@ -62,6 +62,18 @@ These are only for Windows:
 | `win32-tab-bar` | `side` | Or `top`, for tabs in the title bar. |
 | `win32-animation` | `natural` | Or `snappy` or `off`. Always off if animation effects are turned off in Windows, under Accessibility, Visual effects. |
 | `win32-smooth-scroll` | `true` | |
+| `win32-rex` | `false` | Show sessions of the Rex server of this machine. What runs in them keeps running when the window is closed. |
+
+### Rex sessions
+
+With `win32-rex = true`, tabs and splits are those of a session of
+[Rex Server](https://www.superlogical.com/rex), which has to be installed. It's
+started if it isn't running. Closing the window leaves everything running, and
+opening it again shows the same shells. Closing a tab or a split ends what's in
+it. The command palette has the commands to switch between sessions, and to
+make, rename and destroy them.
+
+winstty only connects to the server of this machine, over a named pipe.
 
 See the [Ghostty documentation](https://ghostty.org/docs/config) for the rest.
 Not every option does something on Windows yet.

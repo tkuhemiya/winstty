@@ -14,6 +14,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const App = @import("App.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const Outline = @import("Outline.zig");
+const Session = @import("Session.zig");
 const Surface = @import("Surface.zig");
 const Ticker = @import("Ticker.zig");
 const c = @import("c.zig");
@@ -21,6 +22,7 @@ const glass = @import("glass.zig");
 const layoutpkg = @import("layout.zig");
 const motion = @import("motion.zig");
 const paint = @import("paint.zig");
+const rex = @import("../../rex/main.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -32,6 +34,9 @@ const WM_CLOSE_TAB = c.WM_APP + 1;
 
 /// Posted to destroy the surfaces that the layout is done with.
 const WM_BURY = c.WM_APP + 2;
+
+/// Posted to close the window because there's nothing left to show.
+pub const WM_SESSION_ENDED = c.WM_APP + 3;
 
 // 96 DPI lengths.
 const title_height = 40;
@@ -78,6 +83,14 @@ const await_ms = 10;
 
 /// Retries destroying surfaces while a message box is open.
 const bury_timer = 1;
+
+/// Turns what shows that programs are working.
+const spinner_timer = 3;
+const spinner_ms = 80;
+
+/// Closes the window once there's no message box open.
+const ended_timer = 4;
+const ended_ms = 100;
 const bury_ms = 100;
 
 /// Glass is taken away after everything on it is opaque.
@@ -96,7 +109,11 @@ pub const Tab = struct {
     /// Where it is in the side panel, in rows.
     row: motion.Spring = .at(0),
 
+    /// The window of the session that this is, if it's one.
+    rex_id: []const u8 = "",
+
     fn deinit(self: *Tab, alloc: Allocator) void {
+        if (self.rex_id.len > 0) alloc.free(self.rex_id);
         if (self.title_override) |v| alloc.free(v);
         self.tree.deinit();
     }
@@ -244,6 +261,13 @@ size_limit: apprt.action.SizeLimit = .{
 },
 minimized: bool = false,
 
+/// What's shown, if it's a session of a server.
+session: ?*Session = null,
+
+/// The angle of what shows that programs are working, in steps.
+spinner: u8 = 0,
+spinning: bool = false,
+
 /// True if background-opacity is toggled off.
 force_opaque: bool = false,
 
@@ -263,6 +287,15 @@ pub fn create(app: *App) !*Window {
     _ = try self.newTab(.window);
     self.show();
     return self;
+}
+
+/// Create a window on a session, which is shown once there's something in it.
+/// Takes over the client and the target if this doesn't fail.
+pub fn createFor(app: *App, client: *rex.Client, path: [:0]const u16, target: Session.Target) !void {
+    const self = try createEmpty(app);
+    errdefer _ = c.DestroyWindow(self.hwnd);
+    self.session = try .create(app, self, client, path, target);
+    self.session.?.start();
 }
 
 /// Create a hidden window with no tabs.
@@ -318,6 +351,7 @@ pub fn destroy(self: *Window) void {
         self.active = 0;
         tab.deinit(alloc);
     }
+    self.leaveSession();
     _ = c.DestroyWindow(self.hwnd);
 }
 
@@ -335,6 +369,7 @@ fn deinit(self: *Window) void {
     self.forgetLayout();
     for (self.tabs.items) |*tab| tab.deinit(alloc);
     self.tabs.deinit(alloc);
+    self.leaveSession();
     self.layout.deinit();
     self.placements.deinit(alloc);
     self.boundaries.deinit(alloc);
@@ -345,6 +380,269 @@ fn deinit(self: *Window) void {
         if (font) |v| _ = c.DeleteObject(v);
     }
     alloc.destroy(self);
+}
+
+/// What's in the session keeps running.
+fn leaveSession(self: *Window) void {
+    const session = self.session orelse return;
+    self.session = null;
+    session.destroy();
+}
+
+//---------------------------------------------------------------
+// Sessions
+
+/// The tab of a window of the session.
+fn tabOf(self: *const Window, rex_id: []const u8) ?usize {
+    for (self.tabs.items, 0..) |tab, i| {
+        if (std.mem.eql(u8, tab.rex_id, rex_id)) return i;
+    }
+    return null;
+}
+
+/// Be like the session, except for what can't be shown yet, and what has been
+/// changed here since.
+pub fn followView(self: *Window, session: *Session, view: *const rex.view.View) !void {
+    const alloc = self.app.core_app.alloc;
+
+    // What's shown of another session stays until there's something of this.
+    const any = for (view.items()) |*window| {
+        const layout = window.layout() orelse continue;
+        if (session.isReady(layout) or self.tabOf(window.id()) != null) break true;
+    } else false;
+    if (!any) return;
+
+    const may_focus = session.focusing == 0 and view.revision >= session.focus_revision;
+    const may_resize = session.resizing == 0 and
+        view.revision >= session.ratio_revision and
+        self.drag != .divider;
+    const first = self.tabs.items.len == 0;
+    const was_active = if (self.activeTab()) |v| v.id else 0;
+    const was_focused = self.activeSurface();
+
+    // What's replaced has to last until the layout has followed.
+    var old: std.ArrayList(Tree) = .empty;
+    defer {
+        for (old.items) |*v| v.deinit();
+        old.deinit(alloc);
+    }
+    var gone: std.ArrayList(Tab) = .empty;
+    defer {
+        for (gone.items) |*v| v.deinit(alloc);
+        gone.deinit(alloc);
+    }
+
+    var order: usize = 0;
+    for (view.items()) |*window| {
+        const layout = window.layout() orelse continue;
+        const index = self.tabOf(window.id());
+        if (!session.isReady(layout)) {
+            // It stays as it is for now.
+            if (index) |v| {
+                self.placeTab(v, order);
+                order += 1;
+            }
+            continue;
+        }
+        var tree = try self.treeOf(session, layout) orelse continue;
+        const focused = session.surfaceOf(window.focused_block_id orelse "") orelse firstOf(&tree);
+        if (index) |v| {
+            const tab = &self.tabs.items[v];
+            if (sameTree(&tab.tree, &tree, !may_resize)) {
+                tree.deinit();
+            } else {
+                errdefer tree.deinit();
+                const zoomed: ?*Surface = if (tab.tree.zoomed) |z| tab.tree.nodes[z.idx()].leaf else null;
+                try old.append(alloc, tab.tree);
+                tab.tree = tree;
+                if (zoomed) |z| if (tab.tree.locate(z)) |handle| tab.tree.zoom(handle);
+                if (tab.tree.locate(tab.focused) == null) tab.focused = focused;
+            }
+            self.placeTab(v, order);
+        } else {
+            errdefer tree.deinit();
+            try self.tabs.ensureUnusedCapacity(alloc, 1);
+            const id = try alloc.dupe(u8, window.id());
+            self.tabs.insertAssumeCapacity(@min(order, self.tabs.items.len), .{
+                .id = self.app.nextTabId(),
+                .tree = tree,
+                .focused = focused,
+                .rex_id = id,
+                .row = .at(@floatFromInt(order)),
+            });
+        }
+        const tab = &self.tabs.items[order];
+        order += 1;
+        try self.replaceTitle(&tab.title_override, window.chosenLabel() orelse "");
+        if (may_focus) {
+            if (tab.tree.locate(focused) != null) tab.focused = focused;
+            const zoomed = session.surfaceOf(window.zoomed_block_id orelse "");
+            tab.tree.zoom(if (zoomed) |v| tab.tree.locate(v) else null);
+        }
+    }
+
+    // What's left isn't in the session, or can't be shown.
+    while (self.tabs.items.len > order) {
+        try gone.append(alloc, self.tabs.pop().?);
+    }
+
+    // Which one is shown.
+    const wanted = if (may_focus) self.tabOf(view.active_window_id orelse "-") else null;
+    self.active = wanted orelse for (self.tabs.items, 0..) |tab, i| {
+        if (tab.id == was_active) break i;
+    } else @min(self.active, self.tabs.items.len -| 1);
+    if (self.tabs.items.len == 0) {
+        self.forgetLayout();
+        return;
+    }
+    for (self.tabs.items, 0..) |*tab, i| if (i != self.active) setTabVisible(tab, false);
+    for (gone.items) |*tab| setTabVisible(tab, false);
+    if (first) {
+        self.selection = .at(@floatFromInt(self.active));
+        self.drag = .none;
+    }
+    self.refresh();
+    self.revealActive();
+    if (first) {
+        self.show();
+        session.own("take");
+    } else if (self.activeSurface() != was_focused or self.activeTab().?.id != was_active) {
+        self.focusActive();
+        session.own(if (self.is_active) "take" else "request");
+    } else if (old.items.len > 0) session.own("request");
+}
+
+/// Move a tab that's further along, or where it belongs already.
+fn placeTab(self: *Window, from: usize, to: usize) void {
+    if (from == to or to >= self.tabs.items.len) return;
+    const tab = self.tabs.orderedRemove(from);
+    self.tabs.insertAssumeCapacity(to, tab);
+}
+
+/// The tree of a layout. Null if there's nothing in it that can be shown.
+fn treeOf(self: *Window, session: *Session, node: *const rex.view.Node) !?Tree {
+    const alloc = self.app.core_app.alloc;
+    const split = node.split orelse {
+        const surface = session.surfaceOf(node.block_id orelse return null) orelse return null;
+        return try Tree.init(alloc, surface);
+    };
+    var before = try self.treeOf(session, split.before) orelse return try self.treeOf(session, split.after);
+    var after = after: {
+        errdefer before.deinit();
+        break :after try self.treeOf(session, split.after) orelse return before;
+    };
+    defer before.deinit();
+    defer after.deinit();
+    return try before.split(
+        alloc,
+        .root,
+        switch (split.axis()) {
+            .horizontal => .right,
+            .vertical => .down,
+        },
+        @floatCast(std.math.clamp(split.ratio, 0.01, 0.99)),
+        &after,
+    );
+}
+
+fn firstOf(tree: *const Tree) *Surface {
+    var it = tree.iterator();
+    return it.next().?.view;
+}
+
+fn sameTree(a: *const Tree, b: *const Tree, any_ratio: bool) bool {
+    return sameNode(a, .root, b, .root, any_ratio);
+}
+
+fn sameNode(
+    a: *const Tree,
+    at_a: Tree.Node.Handle,
+    b: *const Tree,
+    at_b: Tree.Node.Handle,
+    any_ratio: bool,
+) bool {
+    switch (a.nodes[at_a.idx()]) {
+        .leaf => |v| return switch (b.nodes[at_b.idx()]) {
+            .leaf => |w| v == w,
+            .split => false,
+        },
+        .split => |v| switch (b.nodes[at_b.idx()]) {
+            .leaf => return false,
+            .split => |w| {
+                if (v.layout != w.layout) return false;
+                if (!any_ratio and @abs(v.ratio - w.ratio) > 0.0005) return false;
+                return sameNode(a, v.left, b, w.left, any_ratio) and
+                    sameNode(a, v.right, b, w.right, any_ratio);
+            },
+        },
+    }
+}
+
+/// Called when the connection is lost, or is back.
+pub fn titleOfSession(self: *Window) void {
+    self.updateTitle();
+    self.invalidateBar();
+}
+
+/// Called when what programs are doing has changed.
+pub fn statusChanged(self: *Window) void {
+    self.invalidateBar();
+    if (self.palette) |v| v.sessionsChanged();
+    const session = self.session orelse return;
+    const spins = self.app.motionStyle() != .off and for (self.tabs.items, 0..) |*tab, i| {
+        if (i != self.active and tabStatus(session, tab).state == .working) break true;
+    } else false;
+    if (spins == self.spinning) return;
+    self.spinning = spins and c.SetTimer(self.hwnd, spinner_timer, spinner_ms, null) != 0;
+    if (!spins) _ = c.KillTimer(self.hwnd, spinner_timer);
+}
+
+/// What the program of a tab that needs the user the most is doing.
+fn tabStatus(session: *Session, tab: *const Tab) rex.status.Summary {
+    var result: rex.status.Summary = .{};
+    var it = tab.tree.iterator();
+    while (it.next()) |entry| {
+        const v = session.summary(entry.view);
+        if (@backingInt(v.state) > @backingInt(result.state)) result = v;
+    }
+    return result;
+}
+
+fn markOf(self: *const Window, summary: rex.status.Summary) paint.Buffer.Mark {
+    return switch (summary.state) {
+        .idle => .none,
+        .working => .{ .working = .{
+            .progress = summary.progress,
+            .spinner = if (self.spinning) self.spinner else null,
+        } },
+        .blocked => .blocked,
+        .done => .done,
+        .@"error" => .@"error",
+    };
+}
+
+/// The mark of a tab that isn't the active one.
+fn tabMark(self: *const Window, index: usize) paint.Buffer.Mark {
+    const session = self.session orelse return .none;
+    if (index == self.active) return .none;
+    return self.markOf(tabStatus(session, &self.tabs.items[index]));
+}
+
+/// What other sessions need the user for, if they do.
+fn elsewhereMark(self: *const Window) paint.Buffer.Mark {
+    const session = self.session orelse return .none;
+    return switch (session.elsewhere()) {
+        .idle, .working => .none,
+        .done => .done,
+        .blocked => .blocked,
+        .@"error" => .@"error",
+    };
+}
+
+/// The user is leaving a pane, and has seen what's in it.
+fn leavePane(self: *Window, surface: *const Surface) void {
+    const session = self.session orelse return;
+    if (self.is_active and !session.following) session.see(surface);
 }
 
 //---------------------------------------------------------------
@@ -368,6 +666,12 @@ fn locate(self: *Window, surface: *const Surface) ?Location {
         return .{ .index = i, .tab = tab, .handle = handle };
     }
     return null;
+}
+
+/// A new tab, as soon as it can be had.
+pub fn openTab(self: *Window) !void {
+    if (self.session) |v| return v.newTab();
+    _ = try self.newTab(.tab);
 }
 
 pub fn newTab(self: *Window, context: apprt.surface.NewSurfaceContext) !*Surface {
@@ -410,11 +714,16 @@ fn insertTab(self: *Window, index: usize, tab: Tab) void {
 
 pub fn selectTab(self: *Window, index: usize) void {
     if (index >= self.tabs.items.len or index == self.active) return;
+    self.leavePane(self.tabs.items[self.active].focused);
     setTabVisible(&self.tabs.items[self.active], false);
     self.active = index;
     self.refresh();
     self.revealActive();
     self.focusActive();
+    if (self.session) |v| {
+        v.tabSelected(self.tabs.items[index].rex_id);
+        self.statusChanged();
+    }
 }
 
 pub fn gotoTab(self: *Window, target: apprt.action.GotoTab) bool {
@@ -459,10 +768,16 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.revealActive();
     self.invalidateBar();
     self.startMotion();
+    if (self.session) |v| v.moveTab(
+        self.tabs.items[to].rex_id,
+        if (to + 1 < self.tabs.items.len) self.tabs.items[to + 1].rex_id else null,
+    );
 }
 
 /// Move the tab with the given surface to a window of its own.
 pub fn moveTabToNewWindow(self: *Window, surface: *const Surface) !bool {
+    // A window is all of a session.
+    if (self.session != null) return false;
     const loc = self.locate(surface) orelse return false;
     if (self.tabs.items.len < 2) return false;
 
@@ -559,6 +874,13 @@ fn closeTabsConfirmed(
         if (tab.id == id) break i;
     } else return;
 
+    if (self.session) |session| {
+        for (self.tabs.items, 0..) |tab, i| {
+            if (Match.match(mode, i, base)) session.closeTab(tab.rex_id);
+        }
+        return;
+    }
+
     var i = self.tabs.items.len;
     while (i > 0) {
         i -= 1;
@@ -570,6 +892,7 @@ fn closeTabsConfirmed(
 /// Remove and destroy a surface, closing its tab and the window if empty.
 /// Must not be called within a callback of the surface.
 pub fn closeSurface(self: *Window, surface: *Surface) !void {
+    if (self.session) |v| return v.closeBlock(surface);
     const alloc = self.app.core_app.alloc;
     const loc = self.locate(surface) orelse return;
     if (!loc.tab.tree.isSplit()) {
@@ -599,6 +922,8 @@ pub fn closeSurface(self: *Window, surface: *Surface) !void {
 }
 
 pub fn needsConfirm(self: *const Window) bool {
+    // It ends nothing.
+    if (self.session != null) return false;
     for (self.tabs.items) |*tab| if (tab.needsConfirm()) return true;
     return false;
 }
@@ -622,6 +947,12 @@ fn setTree(tab: *Tab, tree: Tree) void {
 /// process ends. Must not be called within a callback of `old`.
 pub fn replaceSurface(self: *Window, old: *Surface, command: []const u8) !void {
     const alloc = self.app.core_app.alloc;
+    if (self.session) |session| {
+        // What's running there isn't ours to end, so have a tab for it.
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        return session.newTabWith(try Session.splitCommand(arena.allocator(), command));
+    }
     const first = self.locate(old) orelse return;
 
     const surface = try Surface.create(self, .split, self.contentRect(), command);
@@ -655,6 +986,13 @@ pub fn newSplit(
 ) !bool {
     const alloc = self.app.core_app.alloc;
     if (self.locate(from) == null) return false;
+    if (self.session) |session| {
+        session.newSplit(from, switch (direction) {
+            .left, .right => .horizontal,
+            .up, .down => .vertical,
+        }, direction == .left or direction == .up);
+        return true;
+    }
 
     const surface = try Surface.create(self, .split, self.halfOf(from, direction), null);
     var insert = Tree.init(alloc, surface) catch |err| {
@@ -710,9 +1048,16 @@ pub fn gotoSplit(self: *Window, from: *Surface, to: apprt.action.GotoSplit) !boo
     if (loc.tab.tree.zoomed != null) {
         loc.tab.tree.zoom(if (self.app.config.@"split-preserve-zoom".navigation) handle else null);
     }
+    self.leavePane(loc.tab.focused);
     loc.tab.focused = loc.tab.tree.nodes[handle.idx()].leaf;
     self.refresh();
     self.focusActive();
+    if (self.session) |session| {
+        if (loc.tab.tree.zoomed != null)
+            session.paneZoomed(loc.tab.focused, true)
+        else
+            session.paneFocused(loc.tab.focused);
+    }
     return true;
 }
 
@@ -736,6 +1081,7 @@ pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSpli
         @floatCast(std.math.clamp(ratio, -1, 1)),
     ));
     self.refresh();
+    if (self.session) |v| v.ratiosChanged();
     return true;
 }
 
@@ -744,6 +1090,7 @@ pub fn equalizeSplits(self: *Window, from: *Surface) !bool {
     if (!loc.tab.tree.isSplit()) return false;
     setTree(loc.tab, try loc.tab.tree.equalize(self.app.core_app.alloc));
     self.refresh();
+    if (self.session) |v| v.ratiosChanged();
     return true;
 }
 
@@ -753,6 +1100,7 @@ pub fn toggleZoom(self: *Window, from: *Surface) bool {
     loc.tab.tree.zoom(if (loc.tab.tree.zoomed == null) loc.handle else null);
     loc.tab.focused = from;
     self.refresh();
+    if (self.session) |v| v.paneZoomed(from, loc.tab.tree.zoomed != null);
     return true;
 }
 
@@ -772,7 +1120,9 @@ pub fn focusActive(self: *Window) void {
 pub fn surfaceFocused(self: *Window, surface: *Surface) void {
     const loc = self.locate(surface) orelse return;
     if (loc.tab.focused == surface) return;
+    self.leavePane(loc.tab.focused);
     loc.tab.focused = surface;
+    if (self.session) |v| v.paneFocused(surface);
     syncDimming(loc.tab);
     self.titleChanged(surface);
     if (loc.index == self.active) {
@@ -791,6 +1141,10 @@ pub fn titleChanged(self: *Window, surface: *const Surface) void {
 
 pub fn setTabTitle(self: *Window, surface: *const Surface, title: []const u8) !bool {
     const loc = self.locate(surface) orelse return false;
+    if (self.session) |v| {
+        v.setTabLabel(loc.tab.rex_id, title);
+        return true;
+    }
     try self.replaceTitle(&loc.tab.title_override, title);
     self.titleChanged(surface);
     return true;
@@ -809,13 +1163,15 @@ fn replaceTitle(self: *Window, slot: *?[:0]const u8, title: []const u8) !void {
     slot.* = copy;
 }
 
+fn shownTitle(self: *const Window, tab: *const Tab) []const u8 {
+    if (self.session) |v| if (v.lost) return "Reconnecting to Rex...";
+    return self.title_override orelse tab.title();
+}
+
 fn updateTitle(self: *Window) void {
     const tab = self.activeTab() orelse return;
     const alloc = self.app.core_app.alloc;
-    const title = std.unicode.wtf8ToWtf16LeAllocZ(
-        alloc,
-        self.title_override orelse tab.title(),
-    ) catch return;
+    const title = std.unicode.wtf8ToWtf16LeAllocZ(alloc, self.shownTitle(tab)) catch return;
     defer alloc.free(title);
     _ = c.SetWindowTextW(self.hwnd, title);
 }
@@ -1256,6 +1612,16 @@ fn hideOutline(self: *Window) void {
     if (self.outline_window) |v| v.hide();
 }
 
+/// There's nothing left to show.
+fn sessionEnded(self: *Window) !void {
+    _ = c.KillTimer(self.hwnd, ended_timer);
+    if (self.app.modal > 0) {
+        _ = c.SetTimer(self.hwnd, ended_timer, ended_ms, null);
+        return;
+    }
+    self.destroy();
+}
+
 /// Destroy what the layout is done with, once it's safe to.
 fn bury(self: *Window) void {
     if (self.layout.dead.items.len == 0) return;
@@ -1557,6 +1923,7 @@ pub fn configChanged(self: *Window) void {
         }
     }
     if (self.palette) |v| v.lookChanged();
+    if (self.session) |v| v.configChanged();
     self.drag = .none;
     self.refresh();
     self.revealActive();
@@ -1900,12 +2267,23 @@ fn paintTitle(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
     rect.right -= side;
     if (rect.right <= rect.left) return;
     buf.blendText(
-        self.title_override orelse tab.title(),
+        self.shownTitle(tab),
         rect,
         self.font_bold,
         palette.fg,
         0.85 * self.emphasis(),
         c.DT_CENTER,
+    );
+    const size = self.scaled(close_size);
+    const title = self.titleRect();
+    const top = @divTrunc(title.bottom - size, 2);
+    const right = title.right - self.scaled(strip_margin);
+    buf.statusMark(
+        .{ .left = right - size, .top = top, .right = right, .bottom = top + size },
+        self.elsewhereMark(),
+        palette.fg,
+        palette.bg,
+        @max(0.6, self.emphasis()),
     );
 }
 
@@ -1997,6 +2375,16 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
             c.DT_CENTER,
         );
 
+        // Opposite of the close button.
+        const tab = self.tabRect(i);
+        const space = close.left - tab.left;
+        buf.statusMark(.{
+            .left = tab.right - space - (close.right - close.left),
+            .top = close.top,
+            .right = tab.right - space,
+            .bottom = close.bottom,
+        }, self.tabMark(i), palette.fg, palette.bg, strength);
+
         if (hovered) {
             const on_close = self.hover.eql(.{ .tab_close = i });
             const r: paint.Rect = .from(close);
@@ -2009,6 +2397,15 @@ fn paintTabs(self: *Window, buf: paint.Buffer, palette: paint.Palette) void {
     const r: paint.Rect = .from(plus);
     buf.glass(r, r.w / 2, palette.fg, if (self.hover == .new_tab) 0.18 else 0.09);
     buf.blendText(paint.icon.add, plus, self.font_icon, palette.fg, 0.8 * strength, c.DT_CENTER);
+
+    // There's no title to have it beside.
+    const size = self.scaled(close_size);
+    buf.statusMark(.{
+        .left = plus.right - @divTrunc(size * 2, 3),
+        .top = plus.top - @divTrunc(size, 4),
+        .right = plus.right - @divTrunc(size * 2, 3) + size,
+        .bottom = plus.top - @divTrunc(size, 4) + size,
+    }, self.elsewhereMark(), palette.fg, palette.bg, @max(0.6, strength));
 }
 
 /// The side panel, with a row for each tab.
@@ -2120,7 +2517,8 @@ fn paintRows(
 
         const color = if (contrast and active) palette.bg else palette.fg;
         const alpha: f32 = if (contrast) 1 else if (active) 0.95 else 0.65;
-        const label = self.rowLabelRect(row, hovered);
+        const mark = self.tabMark(i);
+        const label = self.rowLabelRect(row, hovered or mark != .none);
         var number: [8]u8 = undefined;
         if (label.right > label.left) buf.blendText(
             self.tabLabel(i, &number),
@@ -2130,6 +2528,18 @@ fn paintRows(
             alpha * @max(strength, 0.6),
             c.DT_LEFT,
         );
+
+        // Where the close button is when it's hovered.
+        if (!hovered) {
+            const side = row.bottom - row.top;
+            const inset = @divTrunc(side - self.scaled(close_size), 2);
+            buf.statusMark(.{
+                .left = row.right - side + inset,
+                .top = row.top + inset,
+                .right = row.right - inset,
+                .bottom = row.bottom - inset,
+            }, mark, palette.fg, palette.bg, 1);
+        }
 
         if (hovered) {
             const on_close = self.hover.eql(.{ .tab_close = i });
@@ -2169,6 +2579,7 @@ fn updateTooltip(self: *Window) void {
             self.tabLabel(i, &number),
             if (i == self.active) self.font_bold else self.font,
         );
+        if (self.session) |v| if (tabStatus(v, &self.tabs.items[i]).text.len > 0) break :index i;
         break :index if (width > label.right - label.left) i else null;
     };
     if (index == null and self.tooltip_tab == null) return;
@@ -2185,7 +2596,14 @@ fn updateTooltip(self: *Window) void {
         return;
     };
     var number: [8]u8 = undefined;
-    const text = std.unicode.wtf8ToWtf16LeAllocZ(alloc, self.tabLabel(i, &number)) catch return;
+    const says = if (self.session) |v| tabStatus(v, &self.tabs.items[i]).text else "";
+    const utf8 = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        self.tabLabel(i, &number),
+        if (says.len > 0) ": " else "",
+        says,
+    }) catch return;
+    defer alloc.free(utf8);
+    const text = std.unicode.wtf8ToWtf16LeAllocZ(alloc, utf8) catch return;
     defer alloc.free(text);
     tool.lpszText = text;
     tool.rect = self.tabRect(i);
@@ -2332,6 +2750,7 @@ fn onMouseMove(self: *Window, x: c_int, y: c_int) void {
 
             // It's where the pointer has it.
             self.relayoutWith(false);
+            if (self.session) |v| v.ratiosChanged();
             _ = c.InvalidateRect(self.hwnd, null, 0);
         },
     }
@@ -2432,7 +2851,7 @@ fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
             _ = c.SetCapture(self.hwnd);
         },
         .tab_close => |i| self.postCloseTab(self.tabs.items[i].id, .this),
-        .new_tab => _ = try self.newTab(.tab),
+        .new_tab => try self.openTab(),
         .divider => |i| {
             self.drag = .{ .divider = i };
             _ = c.SetCapture(self.hwnd);
@@ -2443,7 +2862,7 @@ fn onLeftDown(self: *Window, x: c_int, y: c_int) !void {
 
 fn onDoubleClick(self: *Window, x: c_int, y: c_int) !void {
     switch (self.hitTest(x, y)) {
-        .caption => _ = try self.newTab(.tab),
+        .caption => try self.openTab(),
         .divider => if (self.activeSurface()) |v| {
             _ = try self.equalizeSplits(v);
         },
@@ -2496,9 +2915,15 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
         c.WM_TIMER => switch (wparam) {
             bury_timer => self.onBury(),
             backing_timer => self.applyTransparency(),
+            spinner_timer => {
+                self.spinner +%= 1;
+                self.invalidateBar();
+            },
+            ended_timer => try self.sessionEnded(),
             else => return null,
         },
         WM_BURY => self.onBury(),
+        WM_SESSION_ENDED => try self.sessionEnded(),
 
         c.WM_NCCALCSIZE => {
             if (wparam == 0 or !self.customFrame()) return null;
@@ -2529,7 +2954,7 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
             if (!self.is_active) {
                 self.outline_amount.finish();
                 self.hideOutline();
-            }
+            } else if (self.session) |v| v.own("take");
             _ = c.InvalidateRect(self.hwnd, null, 0);
             return null;
         },

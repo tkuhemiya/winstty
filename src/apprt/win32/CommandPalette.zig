@@ -20,6 +20,7 @@ const Window = @import("Window.zig");
 const c = @import("c.zig");
 const glass = @import("glass.zig");
 const paint = @import("paint.zig");
+const rex = @import("../../rex/main.zig");
 const themes = @import("themes.zig");
 
 const log = std.log.scoped(.win32);
@@ -46,7 +47,22 @@ const preview_ms = 90;
 const fade_timer = 2;
 
 /// What the list is of.
-const Mode = enum { commands, themes, shells };
+const Mode = enum {
+    commands,
+    themes,
+    shells,
+    sessions,
+    // These are of nothing, and what's typed is a name.
+    rename_session,
+    rename_tab,
+
+    fn isName(self: Mode) bool {
+        return switch (self) {
+            .commands, .themes, .shells, .sessions => false,
+            .rename_session, .rename_tab => true,
+        };
+    }
+};
 
 /// What a row shows, and what's searched.
 pub const Item = struct {
@@ -64,6 +80,9 @@ pub const Item = struct {
     path: []const u8 = "",
     swatch: union(enum) { unknown, none, some: themes.Swatch } = .unknown,
 
+    /// What the programs of a session are doing.
+    state: rex.status.State = .idle,
+
     const Kind = enum {
         action,
         /// Lists the themes.
@@ -76,13 +95,23 @@ pub const Item = struct {
         shells,
         /// A new tab running the command in `path`.
         shell,
+        /// Lists the sessions.
+        sessions,
+        /// The session in `path`.
+        session,
+        new_session,
+        /// Another window on the session.
+        session_window,
+        rename_session,
+        rename_tab,
+        destroy_session,
     };
 
     fn themeName(self: Item) ?[]const u8 {
         return switch (self.kind) {
-            .action, .themes, .shells, .shell => null,
             .theme => self.title,
             .default_theme => "",
+            else => null,
         };
     }
 };
@@ -296,6 +325,9 @@ fn setMode(self: *CommandPalette, mode: Mode) !void {
         .commands => c.L("Execute a command..."),
         .themes => c.L("Choose a theme..."),
         .shells => c.L("Choose a shell..."),
+        .sessions => c.L("Choose a session..."),
+        .rename_session => c.L("Name of the session..."),
+        .rename_tab => c.L("Title of the tab..."),
     };
     _ = c.SendMessageW(edit, c.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(hint)));
     self.mode = mode;
@@ -315,7 +347,94 @@ fn setMode(self: *CommandPalette, mode: Mode) !void {
             try self.loadShells();
             try self.refilter();
         },
+        .sessions => {
+            try self.loadSessions();
+            try self.refilter();
+        },
+        .rename_session, .rename_tab => {
+            self.shown.clearRetainingCapacity();
+            try self.setName();
+            self.invalidate();
+        },
     }
+}
+
+/// Start out with the name there is.
+fn setName(self: *CommandPalette) !void {
+    const edit = self.edit orelse return;
+    const session = self.window.session orelse return;
+    const tab = self.window.activeTab() orelse return;
+    const name = switch (self.mode) {
+        .rename_session => session.label,
+        .rename_tab => tab.title(),
+        else => return,
+    };
+    const alloc = self.window.app.core_app.alloc;
+    const wide = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, name);
+    defer alloc.free(wide);
+    _ = c.SetWindowTextW(edit, wide);
+    _ = c.SendMessageW(edit, c.EM_SETSEL, 0, -1);
+}
+
+/// Use what was typed as a name.
+fn rename(self: *CommandPalette) void {
+    var utf8: [768]u8 = undefined;
+    const name = std.mem.trim(u8, self.queryText(&utf8), " ");
+    const window = self.window;
+    if (window.session) |session| switch (self.mode) {
+        .rename_session => session.setLabel(name),
+        .rename_tab => if (window.activeTab()) |tab| session.setTabLabel(tab.rex_id, name),
+        else => {},
+    };
+    self.close();
+}
+
+/// Called when the sessions, or what programs in them are doing, have changed.
+pub fn sessionsChanged(self: *CommandPalette) void {
+    if (!self.open or self.mode != .sessions) return;
+    const selected = self.selected;
+    self.unload();
+    self.loadSessions() catch return;
+    self.refilter() catch return;
+    if (selected < self.shown.items.len) self.select(selected);
+}
+
+fn loadSessions(self: *CommandPalette) !void {
+    const session = self.window.session orelse return;
+    var arena: ArenaAllocator = .init(self.window.app.core_app.alloc);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var items: std.ArrayList(Item) = .empty;
+    for (session.peers.items) |peer| {
+        const summary = peer.summary();
+        const here = std.mem.eql(u8, peer.id, session.id);
+        const does: []const u8 = switch (summary.state) {
+            .idle => if (here) "Shown here." else "Enter to show it here.",
+            .working => "Working.",
+            .done => "Done.",
+            .@"error" => "Failed.",
+            .blocked => "Needs you.",
+        };
+        try items.append(alloc, .{
+            .kind = .session,
+            .title = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+                peer.label,
+                if (here) " (shown here)" else "",
+            }),
+            .description = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+                does,
+                if (summary.text.len > 0) " " else "",
+                summary.text,
+            }),
+            .action = .ignore,
+            .action_text = "",
+            .keybind = "",
+            .path = try alloc.dupe(u8, peer.id),
+            .state = summary.state,
+        });
+    }
+    self.loaded = .{ .arena = arena, .items = items.items };
 }
 
 fn selectCurrentTheme(self: *CommandPalette) void {
@@ -389,6 +508,7 @@ fn close(self: *CommandPalette) void {
 
 /// Run the selected command.
 fn run(self: *CommandPalette) void {
+    if (self.mode.isName()) return self.rename();
     const loaded = self.loaded orelse return;
     if (self.selected >= self.shown.items.len) return;
     const item = loaded.items[self.shown.items[self.selected]];
@@ -418,6 +538,35 @@ fn run(self: *CommandPalette) void {
             } else {
                 _ = window.newTabWith(.tab, command) catch |err|
                     log.warn("error opening shell command={s} err={}", .{ command, err });
+            }
+            return;
+        },
+        .sessions, .rename_session, .rename_tab => {
+            self.setMode(switch (item.kind) {
+                .sessions => .sessions,
+                .rename_session => .rename_session,
+                else => .rename_tab,
+            }) catch |err| log.warn("error listing err={}", .{err});
+            return;
+        },
+        .session, .new_session, .session_window, .destroy_session => {
+            const window = self.window;
+            const alloc = window.app.core_app.alloc;
+            const id = alloc.dupe(u8, item.path) catch return;
+            defer alloc.free(id);
+            const kind = item.kind;
+            self.close();
+            const session = window.session orelse return;
+            switch (kind) {
+                .session => session.switchTo(id),
+                .new_session => session.switchToNew(),
+                .session_window => window.app.openWindow(.{ .id = session.id }) catch |err|
+                    log.warn("error opening a window err={}", .{err}),
+                else => if (window.app.confirm(
+                    window.hwnd,
+                    c.L("Destroy session?"),
+                    c.L("Every program in the session will be terminated."),
+                )) if (window.session) |v| v.destroySession(),
             }
             return;
         },
@@ -509,6 +658,27 @@ fn updateFonts(self: *CommandPalette) void {
     }
 }
 
+fn sessionItem(kind: Item.Kind, title: []const u8, description: []const u8) Item {
+    return .{
+        .kind = kind,
+        .title = title,
+        .description = description,
+        .action = .ignore,
+        .action_text = "rex session",
+        .keybind = "",
+    };
+}
+
+/// For windows on a session.
+const session_items = [_]Item{
+    sessionItem(.sessions, "Switch Session...", "Show another session of the Rex server here."),
+    sessionItem(.new_session, "New Session", "Show a new session here. This one keeps running."),
+    sessionItem(.session_window, "New Window on This Session", "Show this session in another window as well."),
+    sessionItem(.rename_session, "Rename Session...", "Change the name of this session."),
+    sessionItem(.rename_tab, "Rename Tab...", "Change the title of this tab. Leave it empty for that of the program."),
+    sessionItem(.destroy_session, "Destroy Session...", "End every program in this session."),
+};
+
 /// Copy the commands, so they stay valid while we're open.
 fn load(self: *CommandPalette) !void {
     var arena: ArenaAllocator = .init(self.window.app.core_app.alloc);
@@ -517,7 +687,8 @@ fn load(self: *CommandPalette) !void {
 
     const config = &self.window.app.config;
     const entries = config.@"command-palette-entry".value.items;
-    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len + 2);
+    var items: std.ArrayList(Item) = try .initCapacity(alloc, entries.len + 2 + session_items.len);
+    if (self.window.session != null) for (session_items) |v| items.appendAssumeCapacity(v);
     items.appendAssumeCapacity(.{
         .kind = .shells,
         .title = "Change Shell...",
@@ -974,6 +1145,23 @@ fn onPaint(self: *CommandPalette) void {
             }, font, colors.dim, c.DT_RIGHT);
             title_right -= width + l.pad;
         }
+        if (item.state != .idle) {
+            const size = paint.scale(18, self.dpi);
+            const mark_top = top + @divTrunc(l.row_h - size, 2);
+            buf.statusMark(.{
+                .left = right_edge - size,
+                .top = mark_top,
+                .right = right_edge,
+                .bottom = mark_top + size,
+            }, switch (item.state) {
+                .idle => .none,
+                .working => .{ .working = .{ .progress = null, .spinner = null } },
+                .blocked => .blocked,
+                .done => .done,
+                .@"error" => .@"error",
+            }, colors.fg, colors.bar, 1);
+            title_right -= size + l.pad;
+        }
         if (item.kind == .theme) {
             if (item.swatch == .unknown) {
                 const read = themes.Swatch.read(self.window.app.core_app.alloc, item.path);
@@ -997,6 +1185,8 @@ fn onPaint(self: *CommandPalette) void {
             .commands => "No matching commands",
             .themes => "No matching themes",
             .shells => "No matching shells",
+            .sessions => "No matching sessions",
+            .rename_session, .rename_tab => "Enter to rename",
         }, .{
             .left = 0,
             .top = l.list_top,

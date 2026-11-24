@@ -506,6 +506,81 @@ pub const Buffer = struct {
         self.ring(r, radius, tint, strength * 1.6, strength * 0.5);
     }
 
+    /// What a program is doing, in a square.
+    pub fn statusMark(
+        self: Buffer,
+        rect: c.RECT,
+        mark: Mark,
+        fg: Rgb,
+        bg: Rgb,
+        alpha: f32,
+    ) void {
+        const square: Rect = .from(rect);
+        const size = @min(square.w, square.h) * 0.72;
+        const r: Rect = .{
+            .x = square.x + (square.w - size) / 2,
+            .y = square.y + (square.h - size) / 2,
+            .w = size,
+            .h = size,
+        };
+        const cx = r.x + size / 2;
+        const cy = r.y + size / 2;
+        const line = @max(1.3, size * 0.12);
+        const arm = size * 0.2;
+        switch (mark) {
+            .none => {},
+
+            // Dots in a circle, some of which are brighter.
+            .working => |v| for (0..mark_dots) |i| {
+                const turn = @as(f32, @floatFromInt(i)) / mark_dots * std.math.tau - std.math.tau / 4.0;
+                const dot = size * 0.17;
+                const strength: f32 = if (v.progress) |p|
+                    if (i * 100 < @as(usize, p) * mark_dots) 1 else 0.25
+                else if (v.spinner) |s|
+                    0.2 + 0.8 * @as(f32, @floatFromInt((i + mark_dots - s % mark_dots) % mark_dots)) / mark_dots
+                else
+                    0.6;
+                self.round(.{
+                    .x = cx + @cos(turn) * size * 0.38 - dot / 2,
+                    .y = cy + @sin(turn) * size * 0.38 - dot / 2,
+                    .w = dot,
+                    .h = dot,
+                }, dot / 2, fg, alpha * strength);
+            },
+
+            .blocked => {
+                self.round(r, size / 2, .{ .r = 0xF2, .g = 0xA3, .b = 0x1B }, alpha);
+                self.stroke(cx, cy - arm * 1.2, cx, cy + arm * 0.25, line, bg, alpha);
+                self.stroke(cx, cy + arm * 1.2, cx, cy + arm * 1.2, line, bg, alpha);
+            },
+
+            .done => {
+                const green: Rgb = .{ .r = 0x35, .g = 0xB5, .b = 0x58 };
+                self.round(r, size / 2, green, alpha * 0.22);
+                self.ring(r, size / 2, green, alpha, alpha);
+                self.stroke(cx - arm, cy, cx - arm * 0.2, cy + arm * 0.8, line, green, alpha);
+                self.stroke(cx - arm * 0.2, cy + arm * 0.8, cx + arm * 1.1, cy - arm * 0.8, line, green, alpha);
+            },
+
+            .@"error" => {
+                self.round(r, size / 2, .{ .r = 0xE5, .g = 0x48, .b = 0x4D }, alpha);
+                self.stroke(cx - arm, cy - arm, cx + arm, cy + arm, line, bg, alpha);
+                self.stroke(cx - arm, cy + arm, cx + arm, cy - arm, line, bg, alpha);
+            },
+        }
+    }
+
+    pub const mark_dots = 8;
+
+    pub const Mark = union(enum) {
+        none,
+        /// The spinner is how far it has turned, if it does.
+        working: struct { progress: ?u8, spinner: ?u8 },
+        blocked,
+        done,
+        @"error",
+    };
+
     /// Text that may be on something translucent.
     pub fn blendText(
         self: Buffer,

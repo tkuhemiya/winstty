@@ -12,7 +12,9 @@ const CoreSurface = @import("../../Surface.zig");
 const App = @import("App.zig");
 const InspectorWindow = @import("InspectorWindow.zig");
 const Scrollbar = @import("Scrollbar.zig");
+const termio = @import("../../termio.zig");
 const SearchBar = @import("SearchBar.zig");
+const Session = @import("Session.zig");
 const Window = @import("Window.zig");
 const c = @import("c.zig");
 const paint = @import("paint.zig");
@@ -28,6 +30,13 @@ hwnd: c.HWND,
 
 /// The number of split trees holding this surface.
 refs: usize = 0,
+
+/// What's shown, if it isn't a command of ours, until the core has it.
+backend: ?termio.Backend = null,
+
+/// What's shown of a session, unless that's gone.
+block: ?*Session.Block = null,
+
 core_surface: CoreSurface = undefined,
 
 /// False until the core surface is initialized.
@@ -115,6 +124,30 @@ pub fn create(
     rect: c.RECT,
     command: ?[]const u8,
 ) !*Surface {
+    return try createWith(window, context, rect, command, null);
+}
+
+/// Create a hidden surface for something that isn't a command of ours, which is
+/// taken over even if this fails.
+pub fn createFor(window: *Window, backend: termio.Backend) !*Surface {
+    return try createWith(window, .tab, window.contentRect(), null, backend);
+}
+
+/// Called by the core, once.
+pub fn takeBackend(self: *Surface) ?termio.Backend {
+    defer self.backend = null;
+    return self.backend;
+}
+
+fn createWith(
+    window: *Window,
+    context: apprt.surface.NewSurfaceContext,
+    rect: c.RECT,
+    command: ?[]const u8,
+    backend: ?termio.Backend,
+) !*Surface {
+    var untaken = backend;
+    errdefer if (untaken) |*v| v.deinit();
     const app = window.app;
     const alloc = app.core_app.alloc;
     const parent = window.activeSurface() orelse parent: {
@@ -157,7 +190,7 @@ pub fn create(
 
     var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
     defer config.deinit();
-    if (command orelse app.shell_override) |cmd| {
+    if (if (backend != null) null else command orelse app.shell_override) |cmd| {
         const arena = config._arena.?.allocator();
         config.command = .{ .shell = try arena.dupeSentinel(u8, cmd, 0) };
     }
@@ -169,6 +202,9 @@ pub fn create(
     try app.core_app.addSurface(self);
     errdefer app.core_app.deleteSurface(self);
 
+    self.backend = untaken;
+    untaken = null;
+    errdefer if (self.backend) |*v| v.deinit();
     try self.core_surface.init(alloc, &config, app.core_app, app, self);
     self.ready = true;
     _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -179,6 +215,9 @@ pub fn create(
 pub fn destroy(self: *Surface) void {
     const alloc = self.app.core_app.alloc;
     self.ready = false;
+    if (self.block) |v| {
+        if (v.surface == self) v.surface = null;
+    }
     _ = c.SetWindowLongPtrW(self.hwnd, c.GWLP_USERDATA, 0);
 
     if (self.search) |v| v.destroy();
@@ -226,6 +265,14 @@ pub fn core(self: *Surface) *CoreSurface {
 
 pub fn rtApp(self: *const Surface) *App {
     return self.app;
+}
+
+/// Whether what we show has ended, though it may not have been closed.
+pub fn isFinished(self: *const Surface) bool {
+    return switch (self.core_surface.io.backend) {
+        .exec => false,
+        .rex => |*v| v.finished.load(.acquire),
+    };
 }
 
 /// Deferred because this may be called from within a core callback.
@@ -812,6 +859,8 @@ fn key(
         .mods = currentMods(),
         .unshifted_codepoint = unshifted,
     };
+
+    if (action == .press) if (self.window.session) |v| v.see(self);
 
     var utf8_buf: [64]u8 = undefined;
     if (action != .release) {

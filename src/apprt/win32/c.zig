@@ -217,6 +217,8 @@ pub extern "user32" fn CreateWindowExW(u32, [*:0]const u16, [*:0]const u16, u32,
 pub extern "user32" fn DestroyWindow(HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn DefWindowProcW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 pub extern "user32" fn GetMessageW(*MSG, ?HWND, u32, u32) callconv(.winapi) BOOL;
+pub const PM_REMOVE = 1;
+pub extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostMessageW(?HWND, u32, WPARAM, LPARAM) callconv(.winapi) BOOL;
