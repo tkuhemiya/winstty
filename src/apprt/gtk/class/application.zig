@@ -816,6 +816,7 @@ pub const Application = extern struct {
             .float_window,
             .toggle_visibility,
             .toggle_background_opacity,
+            .toggle_side_panel,
             .render_inspector,
             .renderer_health,
             .color_change,

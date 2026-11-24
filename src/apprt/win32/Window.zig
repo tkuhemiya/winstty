@@ -203,6 +203,8 @@ card_amount: motion.Spring = .at(0),
 
 /// How much of the side panel is in view.
 panel: motion.Spring = .at(0),
+/// Whether it has been shown or hidden by hand.
+panel_override: ?bool = null,
 /// Pixels scrolled off the top of the list of tabs.
 panel_scroll: c_int = 0,
 tooltip: ?c.HWND = null,
@@ -855,7 +857,18 @@ fn barVisible(self: *const Window) bool {
 
 /// Whether tabs are in a panel at the side.
 fn panelVisible(self: *const Window) bool {
-    return self.tabsAtSide() and self.tabsVisible();
+    return self.tabsAtSide() and (self.panel_override orelse self.tabsVisible());
+}
+
+/// Show or hide the side panel, whatever is configured.
+pub fn togglePanel(self: *Window) bool {
+    if (!self.tabsAtSide()) return false;
+    self.panel_override = !self.panelVisible();
+    self.dropRow(false);
+    self.refresh();
+    self.revealActive();
+    self.updateTooltip();
+    return true;
 }
 
 const Style = @FieldType(Config, "macos-titlebar-style");

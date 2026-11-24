@@ -367,6 +367,9 @@ pub const Action = union(Key) {
     /// Set the application window theme for this session.
     set_window_theme: WindowTheme,
 
+    /// Show or hide the side panel that holds the tabs of a window.
+    toggle_side_panel,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -440,6 +443,7 @@ pub const Action = union(Key) {
         move_tab_to_new_window,
         resize_window,
         set_window_theme,
+        toggle_side_panel,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

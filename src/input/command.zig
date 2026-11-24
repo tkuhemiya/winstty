@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const Action = @import("Binding.zig").Action;
+const build_config = @import("../build_config.zig");
 const i18n = @import("../os/i18n.zig");
 
 /// A command is a named binding action that can be executed from
@@ -701,6 +702,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .title = i18n.N_("Toggle Background Opacity"),
             .description = i18n.N_("Toggle the background opacity of a window that started transparent."),
         }},
+
+        .toggle_side_panel => comptime if (build_config.app_runtime == .win32) &.{.{
+            .action = .toggle_side_panel,
+            .title = i18n.N_("Toggle Side Panel"),
+            .description = i18n.N_("Show or hide the side panel that holds the tabs of the window."),
+        }} else &.{},
 
         .check_for_updates => comptime &.{.{
             .action = .check_for_updates,

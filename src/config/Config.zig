@@ -7279,6 +7279,16 @@ pub const Keybinds = struct {
             .toggle_command_palette,
         );
 
+        // Toggle the side panel. Without one, the key is for the terminal.
+        if (comptime build_config.app_runtime == .win32) {
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = '/' }, .mods = .{ .ctrl = true } },
+                .toggle_side_panel,
+                .{ .performable = true },
+            );
+        }
+
         // Mac-specific keyboard bindings.
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(

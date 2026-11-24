@@ -597,6 +597,14 @@ pub const Action = union(enum) {
     /// found by running `ghostty +version`.
     toggle_tab_overview,
 
+    /// Show or hide the side panel of the window that holds its tabs. This
+    /// overrides `window-show-tab-bar` for the window.
+    ///
+    /// Does nothing if `win32-tab-bar` isn't `side`.
+    ///
+    /// Only implemented on Windows.
+    toggle_side_panel,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1476,6 +1484,7 @@ pub const Action = union(enum) {
             .move_tab,
             .move_tab_to_new_window,
             .toggle_tab_overview,
+            .toggle_side_panel,
             .new_split,
             .goto_split,
             .goto_window,

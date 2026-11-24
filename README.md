@@ -71,6 +71,7 @@ Not every option does something on Windows yet.
 | Ctrl+Shift+T | New tab |
 | Ctrl+Shift+O / E | Split right / down |
 | Ctrl+Shift+W | Close tab |
+| Ctrl+/ | Show or hide the side panel |
 | Ctrl+Shift+P | Command palette |
 | Ctrl+Shift+F | Search |
 
