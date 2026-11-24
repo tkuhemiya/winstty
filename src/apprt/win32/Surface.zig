@@ -43,6 +43,9 @@ inspector: ?*InspectorWindow = null,
 /// Read by the render thread.
 dim: std.atomic.Value(u32) = .init(0),
 
+/// Read by the render thread.
+smooth_scroll: std.atomic.Value(bool) = .init(false),
+
 scrollbar: ?*Scrollbar = null,
 scrollbar_state: terminal.Scrollbar = .zero,
 
@@ -101,6 +104,7 @@ pub fn create(
         .hwnd = hwnd,
         .cursor = c.LoadCursorW(null, c.IDC_IBEAM),
     };
+    self.smooth_scroll.store(app.config.@"win32-smooth-scroll", .release);
     try self.syncScrollbar();
     errdefer if (self.scrollbar) |v| v.destroy();
 
@@ -356,6 +360,7 @@ pub fn place(self: *Surface, area: c.RECT) void {
 }
 
 pub fn configChanged(self: *Surface) void {
+    self.smooth_scroll.store(self.app.config.@"win32-smooth-scroll", .release);
     self.syncScrollbar() catch |err| log.warn("error creating scrollbar err={}", .{err});
     if (self.scrollbar) |v| v.invalidate();
 }

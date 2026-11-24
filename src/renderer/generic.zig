@@ -1134,6 +1134,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn animationWake(self: *const Self) ?AnimationWake {
+            // Presenting waits for the display, which paces this.
+            if (@hasDecl(GraphicsAPI, "isScrolling")) {
+                if (self.api.isScrolling()) return .{ .delay_ms = 0, .kind = .draw };
+            }
+
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
             const shader_delay: ?u64 = shader: {
@@ -1242,6 +1247,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Caller must lock the draw mutex before calling this function.
         /// Resources that are already released are skipped.
         pub fn releaseGpuResources(self: *Self) void {
+            if (@hasDecl(GraphicsAPI, "releaseResources")) self.api.releaseResources();
             if (self.swap_chain) |*sc| {
                 // Waits for any in-flight frames to complete, then
                 // frees all GPU resources.
@@ -1807,6 +1813,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.cells_rebuilt = false;
             self.images_rebuilt = false;
+
+            if (@hasDecl(GraphicsAPI, "setScrollGeometry")) self.api.setScrollGeometry(.{
+                .total = self.scrollbar.total,
+                .offset = self.scrollbar.offset,
+                .rows = self.scrollbar.len,
+                .row_height = self.grid_metrics.cell_height,
+                .padding_top = self.size.padding.top,
+                .width = surface_size.width,
+                .height = surface_size.height,
+            });
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();

@@ -290,8 +290,9 @@ pub fn gotoTab(self: *Window, target: apprt.action.GotoTab) bool {
         .last => len - 1,
         _ => index: {
             const raw = @backingInt(target);
-            if (raw < 0) return false;
-            break :index @min(@as(usize, @intCast(raw)), len - 1);
+            // Despite what its documentation says, this counts from one.
+            if (raw < 1) return false;
+            break :index @min(@as(usize, @intCast(raw)) - 1, len - 1);
         },
     };
     if (index == self.active) return false;

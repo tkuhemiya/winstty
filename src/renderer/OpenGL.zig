@@ -14,6 +14,7 @@ const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
 const build_config = @import("../build_config.zig");
 const wgl = @import("opengl/wgl.zig");
+pub const SmoothScroll = @import("opengl/SmoothScroll.zig");
 
 /// The Win32 apprt presents straight to its window using WGL. Everything
 /// else renders offscreen using EGL and exports frames to the apprt.
@@ -59,6 +60,10 @@ context: if (use_wgl) wgl.Context else *gl.egl.Context,
 /// The surface we present to, and what dims it.
 rt_surface: if (use_wgl) *apprt.Surface else void,
 dimmer: if (use_wgl) ?wgl.Dimmer else void = if (use_wgl) null else {},
+
+/// Smooth scrolling, and what it needs to know of the frame being drawn.
+smooth_scroll: if (use_wgl) ?SmoothScroll else void = if (use_wgl) null else {},
+scroll_geometry: SmoothScroll.Geometry = .{},
 
 pub fn init(
     alloc: Allocator,
@@ -252,9 +257,27 @@ pub fn threadExit(self: *OpenGL) void {
     if (comptime use_wgl) {
         if (self.dimmer) |v| v.deinit();
         self.dimmer = null;
+        SmoothScroll.reset(&self.smooth_scroll);
         wgl.Context.releaseCurrent();
     } else self.device.display.releaseCurrent();
     gl.glad.unload();
+}
+
+/// Tell us about the frame that's about to be drawn.
+pub fn setScrollGeometry(self: *OpenGL, geometry: SmoothScroll.Geometry) void {
+    self.scroll_geometry = geometry;
+}
+
+/// Whether more frames are needed, for a scroll that's in progress.
+pub fn isScrolling(self: *const OpenGL) bool {
+    if (comptime !use_wgl) return false;
+    const scroll = self.smooth_scroll orelse return false;
+    return scroll.position.animating;
+}
+
+/// Called on the render thread when the surface is hidden.
+pub fn releaseResources(self: *OpenGL) void {
+    if (comptime use_wgl) SmoothScroll.reset(&self.smooth_scroll);
 }
 
 /// Get the current size of the runtime surface.
@@ -325,6 +348,10 @@ pub fn present(
 ) !ExportedFrame {
     if (comptime use_wgl) {
         try target.blitToScreen();
+        if (self.rt_surface.smooth_scroll.load(.acquire))
+            try SmoothScroll.present(&self.smooth_scroll, &target, self.scroll_geometry)
+        else
+            SmoothScroll.reset(&self.smooth_scroll);
         const dim = self.rt_surface.dim.load(.acquire);
         if (dim >> 24 > 0) {
             if (self.dimmer == null) self.dimmer = try .init();

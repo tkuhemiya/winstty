@@ -1451,6 +1451,12 @@ input: RepeatableReadableIO = .{},
 ///     a scrollbar.
 scrollbar: Scrollbar = .system,
 
+/// Animate scrolling through the scrollback, rather than jumping by rows.
+/// Programs that handle scrolling themselves aren't affected.
+///
+/// This is only supported on Windows.
+@"win32-smooth-scroll": bool = true,
+
 /// Match a regular expression against the terminal text and associate clicking
 /// it with an action. This can be used to match URLs, file paths, etc. Actions
 /// can be opening using the system opener (e.g. `open` or `xdg-open`) or
