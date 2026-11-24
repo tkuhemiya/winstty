@@ -145,6 +145,37 @@ pub fn deinit(self: *Self) void {
     self.export_texture.destroy();
 }
 
+/// Copy this target to the window's back buffer. Used with WGL.
+///
+/// GL_FRAMEBUFFER_SRGB is off for the copy for the same reason as in
+/// `exportDmabuf`: the stored values are already sRGB.
+pub fn blitToScreen(self: *const Self) !void {
+    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
+    };
+
+    const read_bind = try self.framebuffer.bind(.read);
+    defer read_bind.unbind();
+
+    const screen: gl.Framebuffer = .{ .id = 0 };
+    const draw_bind = try screen.bind(.draw);
+    defer draw_bind.unbind();
+
+    try gl.blitFramebuffer(
+        0,
+        0,
+        @intCast(self.width),
+        @intCast(self.height),
+        0,
+        0,
+        @intCast(self.width),
+        @intCast(self.height),
+        .{ .color_buffer_bit = true },
+        .nearest,
+    );
+}
+
 pub fn exportDmabuf(
     self: *const Self,
     display: *egl.Display,

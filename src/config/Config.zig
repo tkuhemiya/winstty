@@ -57,7 +57,7 @@ const terminal = struct {
 const log = std.log.scoped(.config);
 
 /// Used on Unixes for some defaults.
-const c = @import("posix_c");
+const c = if (builtin.target.os.tag != .windows) @import("posix_c") else struct {};
 
 pub const compatibility = std.StaticStringMap(
     cli.CompatibilityHandler(Config),
@@ -4831,6 +4831,10 @@ pub fn finalize(self: *Config) !void {
                 // read from SHELL if we're in a probable CLI environment.
                 if (!probable_cli) break :shell_env;
 
+                // SHELL isn't a Windows convention. Shells such as Git Bash
+                // export it as a POSIX path that CreateProcess can't run.
+                if (comptime builtin.target.os.tag == .windows) break :shell_env;
+
                 const value = global.environ().getAlloc(alloc, "SHELL") catch |err| switch (err) {
                     error.EnvironmentVariableMissing => break :shell_env,
                     else => return err,
@@ -4896,7 +4900,7 @@ pub fn finalize(self: *Config) !void {
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
-        .none => {},
+        .none, .win32 => {},
         .gtk => {
             switch (self.@"gtk-single-instance") {
                 .true, .false => {},
@@ -9374,7 +9378,7 @@ pub const GtkTitlebarStyle = enum(c_int) {
             .{ .name = "GhosttyGtkTitlebarStyle" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 };
 
@@ -10096,7 +10100,7 @@ pub const WindowDecoration = enum(c_int) {
             .{ .name = "GhosttyConfigWindowDecoration" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 
     pub fn parseCLI(input_: ?[]const u8) !WindowDecoration {

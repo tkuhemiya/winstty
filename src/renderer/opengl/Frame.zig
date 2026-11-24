@@ -74,6 +74,14 @@ pub fn complete(self: *const Self, sync: bool) void {
         break :frame frame;
     } else null;
 
+    // WGL has already presented, and SwapBuffers does its own throttling.
+    if (comptime OpenGL.use_wgl) {
+        self.renderer.frameCompleted(
+            if (presented_frame != null) health else .unhealthy,
+        );
+        return;
+    }
+
     // Sync after frame draw AND frame present GL calls.
     gl.finish();
 

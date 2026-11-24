@@ -12,7 +12,14 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
-pub const Device = @import("opengl/Device.zig");
+const build_config = @import("../build_config.zig");
+const wgl = @import("opengl/wgl.zig");
+
+/// The Win32 apprt presents straight to its window using WGL. Everything
+/// else renders offscreen using EGL and exports frames to the apprt.
+pub const use_wgl = build_config.app_runtime == .win32;
+
+pub const Device = if (use_wgl) wgl.Device else @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -47,13 +54,25 @@ blending: configpkg.Config.AlphaBlending,
 /// The shared render device.
 device: *const Device,
 
-egl_context: *gl.egl.Context,
+context: if (use_wgl) wgl.Context else *gl.egl.Context,
 
 pub fn init(
     alloc: Allocator,
     device: *const Device,
     opts: rendererpkg.Options,
 ) !OpenGL {
+    if (comptime use_wgl) return .{
+        .alloc = alloc,
+        .blending = opts.config.blending,
+        .device = device,
+        .context = try .init(
+            device,
+            @ptrCast(opts.rt_surface.hwnd),
+            MIN_VERSION_MAJOR,
+            MIN_VERSION_MINOR,
+        ),
+    };
+
     const display = device.display;
 
     // Bind to OpenGL API explicitly before we create the context,
@@ -85,13 +104,17 @@ pub fn init(
         .alloc = alloc,
         .blending = opts.config.blending,
         .device = device,
-        .egl_context = context,
+        .context = context,
     };
 }
 
 pub fn deinit(self: *OpenGL) void {
-    self.device.display.releaseCurrent();
-    self.egl_context.destroy(self.device.display) catch {};
+    if (comptime use_wgl) {
+        self.context.deinit();
+    } else {
+        self.device.display.releaseCurrent();
+        self.context.destroy(self.device.display) catch {};
+    }
     self.* = undefined;
 }
 
@@ -200,7 +223,18 @@ fn prepareContext(getProcAddress: anytype) !void {
 /// function pointers so all subsequent GL work on this thread is valid.
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
-    try self.device.display.makeCurrent(null, null, self.egl_context);
+    if (comptime use_wgl) {
+        try self.context.makeCurrent();
+        errdefer wgl.Context.releaseCurrent();
+
+        // Pace presentation with the compositor. This only blocks the
+        // render thread. Frames are still driven by wakeups.
+        if (self.device.swap_interval) |f| _ = f(1);
+        try prepareContext(&wgl.getProcAddress);
+        return;
+    }
+
+    try self.device.display.makeCurrent(null, null, self.context);
     // Load our function pointers for this thread's threadlocal.
     try prepareContext(&gl.egl.getProcAddress);
 }
@@ -209,7 +243,10 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
 /// thread; unbinds the context from this thread so it can be destroyed on
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
-    self.device.display.releaseCurrent();
+    if (comptime use_wgl)
+        wgl.Context.releaseCurrent()
+    else
+        self.device.display.releaseCurrent();
     gl.glad.unload();
 }
 
@@ -279,10 +316,16 @@ pub fn present(
     target: Target,
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
+    if (comptime use_wgl) {
+        try target.blitToScreen();
+        try self.context.swap();
+        return;
+    }
+
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
     if (presentation_health == .healthy) {
-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
+        if (target.exportDmabuf(self.device.display, self.context)) |dmabuf| {
             return .{ .dmabuf = dmabuf };
         } else |_| {
             log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
@@ -298,7 +341,9 @@ pub fn present(
 }
 
 /// A finished frame exported for presentation by the apprt.
-pub const ExportedFrame = union(enum) {
+///
+/// Void for WGL, where `present` has already put the frame on screen.
+pub const ExportedFrame = if (use_wgl) void else union(enum) {
     dmabuf: Dmabuf,
     memory: Memory,
 

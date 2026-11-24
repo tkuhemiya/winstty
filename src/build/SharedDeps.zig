@@ -224,7 +224,8 @@ pub fn add(
     // POSIX C imports that are used throughout Ghostty on a general basis.
     // (note: errno is C stdlib but we just include it here because that's
     // where it's generally included otherwise)
-    try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+    // Windows has no pwd.h and friends, so there is nothing to import there.
+    if (target.result.os.tag != .windows) try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
         .source = .{ .includes = .{ .files = &.{
             .{ .path = "errno.h" },
             .{ .path = "pwd.h" },
@@ -699,6 +700,9 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtk(step),
+            .win32 => for ([_][]const u8{
+                "user32", "gdi32", "opengl32", "imm32", "dwmapi", "shell32",
+            }) |lib| step.root_module.linkSystemLibrary(lib, .{}),
         }
     }
 
