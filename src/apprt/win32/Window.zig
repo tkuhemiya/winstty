@@ -158,6 +158,22 @@ fn show(self: *Window) void {
     if (config.fullscreen != .false) self.toggleFullscreen();
 }
 
+/// Destroy the window and everything in it.
+///
+/// Surfaces are destroyed while the window is still whole. If that's left to
+/// WM_DESTROY, the GPU driver never frees some of the memory for their buffers.
+pub fn destroy(self: *Window) void {
+    const alloc = self.app.core_app.alloc;
+    _ = c.ShowWindow(self.hwnd, c.SW_HIDE);
+    while (self.tabs.pop()) |popped| {
+        // Nothing may be found through a tab that's going away.
+        var tab = popped;
+        self.active = 0;
+        tab.deinit(alloc);
+    }
+    _ = c.DestroyWindow(self.hwnd);
+}
+
 /// Called from WM_DESTROY, when child windows still exist.
 fn deinit(self: *Window) void {
     const alloc = self.app.core_app.alloc;
@@ -1082,7 +1098,7 @@ fn message(self: *Window, msg: u32, wparam: c.WPARAM, lparam: c.LPARAM) !?c.LRES
                 c.L("Close window?"),
                 c.L("All terminal sessions in this window will be terminated."),
             )) return 0;
-            _ = c.DestroyWindow(self.hwnd);
+            self.destroy();
         },
 
         WM_CLOSE_TAB => {

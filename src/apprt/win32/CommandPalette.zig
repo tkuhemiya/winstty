@@ -231,10 +231,15 @@ fn close(self: *CommandPalette) void {
     self.closing = true;
     defer self.closing = false;
 
+    // Hiding the popup usually activates our window, but not always, and then
+    // the focus would stay with the hidden field.
+    const active = self.hwnd != null and c.GetActiveWindow() == self.hwnd;
     self.open = false;
     self.unload();
     if (self.hwnd) |v| _ = c.ShowWindow(v, c.SW_HIDE);
-    if (!self.destroying) self.window.focusActive();
+    if (self.destroying) return;
+    if (active) _ = c.SetActiveWindow(self.window.hwnd);
+    self.window.focusActive();
 }
 
 /// Run the selected command.

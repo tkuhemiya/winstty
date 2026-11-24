@@ -176,7 +176,7 @@ fn closeAll(self: *App) void {
     self.quitting = true;
     while (self.windows.items.len > 0) {
         const len = self.windows.items.len;
-        _ = c.DestroyWindow(self.windows.items[len - 1].hwnd);
+        self.windows.items[len - 1].destroy();
 
         // Destroying the window removes it. If it somehow didn't, don't spin.
         if (self.windows.items.len >= len) return;

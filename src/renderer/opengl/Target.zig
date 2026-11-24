@@ -27,6 +27,9 @@ const Dmabuf = @import("../Dmabuf.zig");
 
 const log = std.log.scoped(.opengl);
 
+/// WGL presents `texture` itself, so there's nothing to export.
+const has_export = !@import("../OpenGL.zig").use_wgl;
+
 /// Options for initializing a Target
 pub const Options = struct {
     /// Desired width
@@ -44,8 +47,8 @@ texture: gl.Texture,
 /// A plain RGBA8 texture + framebuffer that we blit `texture` into for
 /// dma-buf export. Mesa can't export sRGB textures, so we blit the
 /// already-sRGB-encoded pixels into this non-sRGB texture and export it.
-export_texture: gl.Texture,
-export_framebuffer: gl.Framebuffer,
+export_texture: if (has_export) gl.Texture else void,
+export_framebuffer: if (has_export) gl.Framebuffer else void,
 
 /// Current width of this target.
 width: usize,
@@ -89,6 +92,15 @@ pub fn init(opts: Options) !Self {
             },
         }
     }
+
+    if (comptime !has_export) return .{
+        .framebuffer = fbo,
+        .texture = texture,
+        .export_framebuffer = {},
+        .export_texture = {},
+        .width = opts.width,
+        .height = opts.height,
+    };
 
     // --- Export texture (plain RGBA8, for dma-buf export) ---
     const export_texture = try gl.Texture.create();
@@ -141,8 +153,10 @@ pub fn init(opts: Options) !Self {
 pub fn deinit(self: *Self) void {
     self.framebuffer.destroy();
     self.texture.destroy();
-    self.export_framebuffer.destroy();
-    self.export_texture.destroy();
+    if (comptime has_export) {
+        self.export_framebuffer.destroy();
+        self.export_texture.destroy();
+    }
 }
 
 /// Copy this target to the window's back buffer. Used with WGL.
